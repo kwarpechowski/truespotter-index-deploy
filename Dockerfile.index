@@ -1,0 +1,45 @@
+# TrueSpotter index (Rust) — the embedded search engine (spec
+# rust-embedded-rag): OpenSearch REST subset over Tantivy BM25 +
+# brute-force kNN. musl → scratch, same pattern as Dockerfile.core.
+# Build context: repo root (`docker build -f Dockerfile.index .`).
+FROM rust:1-slim AS build
+WORKDIR /src
+
+# musl toolchain for a fully static binary (scratch final stage).
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+
+# Layer-cacheable dependency build: manifest + lock + dummy sources first,
+# so source edits never invalidate the compiled-dependencies layer.
+COPY src/rust/truespotter-index/Cargo.toml src/rust/truespotter-index/Cargo.lock* ./
+RUN mkdir src && \
+    printf 'fn main() {}' > src/main.rs && \
+    cargo build --release --target x86_64-unknown-linux-musl && \
+    cargo clean --release --target x86_64-unknown-linux-musl -p truespotter-index && \
+    rm -rf src
+
+# Real sources — only this layer rebuilds on code changes.
+COPY src/rust/truespotter-index/src ./src
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    && mkdir -p /out \
+    && cp target/x86_64-unknown-linux-musl/release/truespotter-index /out/
+
+# `scratch` needs the system CA bundle for outbound TLS (OpenSearch backfill).
+RUN cp /etc/ssl/certs/ca-certificates.crt /out/
+
+FROM build AS dirprep
+RUN mkdir -p /tmpdirs/data /tmpdirs/tmp && chmod -R 777 /tmpdirs
+
+FROM dirprep AS final
+WORKDIR /app
+COPY --from=build /out/truespotter-index ./
+COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=dirprep /tmpdirs/data /data
+COPY --from=dirprep /tmpdirs/tmp /tmp
+ENV PORT=8090     RUST_LOG=info     DATA_DIR=/data     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+EXPOSE 8090
+
+# No shell in scratch — the binary self-checks (--healthcheck mode in main.rs).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3     CMD ["/app/truespotter-index", "--healthcheck"]
+ENTRYPOINT ["/app/truespotter-index"]

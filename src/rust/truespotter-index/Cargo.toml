@@ -1,0 +1,31 @@
+[package]
+name = "truespotter-index"
+version = "0.1.0"
+edition = "2021"
+description = "TrueSpotter embedded search engine — OpenSearch REST subset over Tantivy BM25 + brute-force kNN (spec rust-embedded-rag)"
+license = "Proprietary"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["http1", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+tantivy = "0.22"
+memmap2 = "0.9"
+regex = "1"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.4", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
