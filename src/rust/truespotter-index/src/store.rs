@@ -1,8 +1,8 @@
 //! Postgres `catalog_documents` — the source of truth for the embedded
 //! index — plus the `--backfill` mode: scroll the EXISTING OpenSearch
-//! `products` index (OPENSEARCH_URL) and upsert every doc (embedding
-//! array → LE f32 bytea) into Postgres. Existing rows are skipped unless
-//! `--force`.
+//! `products` index (OPENSEARCH_URL) and upsert docs in batches of
+//! BACKFILL_BATCH (multi-row INSERT, one COMMIT per batch) into Postgres.
+//! Existing rows are skipped unless `--force`.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -77,34 +77,120 @@ pub async fn load_all(pool: &PgPool) -> Result<Vec<EngineDoc>, String> {
         .collect())
 }
 
-pub async fn upsert_batch(pool: &PgPool, docs: &[EngineDoc], force: bool) -> Result<usize, String> {
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| format!("begin upsert: {e}"))?;
-    let mut n = 0usize;
+/// Rows per multi-row INSERT + COMMIT during `--backfill`. One round trip
+/// per batch instead of one per row (34,925 docs → ~140 transactions).
+pub const BACKFILL_BATCH: usize = 250;
+
+/// Build the multi-row upsert SQL for `n` rows
+/// (`VALUES ($1,$2,$3),($4,$5,$6),...` + ON CONFLICT clause).
+fn multi_upsert_sql(n: usize, force: bool) -> String {
+    let mut sql = String::from("INSERT INTO catalog_documents (slug, doc, embedding) VALUES ");
+    for i in 0..n {
+        if i > 0 {
+            sql.push(',');
+        }
+        let b = i * 3 + 1;
+        sql.push_str(&format!("(${b}, ${}, ${})", b + 1, b + 2));
+    }
+    if force {
+        sql.push_str(
+            " ON CONFLICT (slug) DO UPDATE SET doc = EXCLUDED.doc, embedding = EXCLUDED.embedding, updated_at = now()",
+        );
+    } else {
+        sql.push_str(" ON CONFLICT (slug) DO NOTHING");
+    }
+    sql
+}
+
+/// Multi-row batch upsert (backfill path): ONE statement + ONE commit per
+/// batch. `rows_affected` counts inserted + updated (DO UPDATE) or only
+/// inserted (DO NOTHING) — same semantics as the old per-row sum.
+pub async fn upsert_multi(pool: &PgPool, docs: &[EngineDoc], force: bool) -> Result<usize, String> {
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    let sql = multi_upsert_sql(docs.len(), force);
+    let mut q = sqlx::query(&sql);
     for d in docs {
         let emb: Option<Vec<u8>> = d.embedding.as_ref().map(|v| vec_to_bytes(v));
-        let sql = if force {
-            "INSERT INTO catalog_documents (slug, doc, embedding) VALUES ($1, $2, $3)
-             ON CONFLICT (slug) DO UPDATE SET doc = EXCLUDED.doc, embedding = EXCLUDED.embedding, updated_at = now()"
-        } else {
-            "INSERT INTO catalog_documents (slug, doc, embedding) VALUES ($1, $2, $3)
-             ON CONFLICT (slug) DO NOTHING"
-        };
-        let res = sqlx::query(sql)
-            .bind(&d.slug)
-            .bind(&d.doc)
-            .bind(emb)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("upsert {}: {e}", d.slug))?;
-        n += res.rows_affected() as usize;
+        q = q.bind(&d.slug).bind(&d.doc).bind(emb);
     }
-    tx.commit()
+    let res = q
+        .execute(pool)
         .await
-        .map_err(|e| format!("commit upsert: {e}"))?;
-    Ok(n)
+        .map_err(|e| format!("multi upsert ({} docs): {e}", docs.len()))?;
+    Ok(res.rows_affected() as usize)
+}
+
+/// Buffered chunking for the backfill scroll: emits full batches of `cap`
+/// docs across scroll-page boundaries; the caller flushes the final partial
+/// batch with [`BatchBuffer::take`].
+pub struct BatchBuffer {
+    cap: usize,
+    buf: Vec<EngineDoc>,
+}
+
+impl BatchBuffer {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Push a doc; returns `Some(full_batch)` when the buffer reached `cap`.
+    pub fn push(&mut self, d: EngineDoc) -> Option<Vec<EngineDoc>> {
+        self.buf.push(d);
+        if self.buf.len() >= self.cap {
+            Some(std::mem::take(&mut self.buf))
+        } else {
+            None
+        }
+    }
+
+    /// Flush the final (possibly partial) batch.
+    pub fn take(&mut self) -> Vec<EngineDoc> {
+        std::mem::take(&mut self.buf)
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+/// Parse one OpenSearch scroll hit → EngineDoc (`_id` wins over `source.slug`;
+/// the `embedding` float array is pulled out of the doc into the bytea side).
+/// Returns None when the hit carries no usable id.
+pub fn hit_to_doc(hit: &serde_json::Value) -> Option<EngineDoc> {
+    let source = hit.get("_source")?;
+    let slug = hit
+        .get("_id")
+        .and_then(|i| i.as_str())
+        .or_else(|| source.get("slug").and_then(|s| s.as_str()))
+        .map(String::from);
+    let slug = slug.filter(|s| !s.is_empty())?;
+    let mut doc = source.clone();
+    // The embedding travels as a float array in _source; pull it out
+    // (it is NOT part of the indexed doc payload — stored separately).
+    let embedding = doc.get("embedding").and_then(|e| e.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>()
+    });
+    if let Some(obj) = doc.as_object_mut() {
+        obj.remove("embedding");
+    }
+    Some(EngineDoc {
+        slug,
+        doc,
+        embedding,
+    })
 }
 
 /// Single-doc upsert (the write path). `embedding == None` keeps the stored
@@ -175,6 +261,7 @@ pub async fn backfill(
     let mut scroll_id: Option<String> = None;
     let mut scanned = 0usize;
     let mut upserted = 0usize;
+    let mut buf = BatchBuffer::new(BACKFILL_BATCH);
     loop {
         let (url, body) = match &scroll_id {
             None => (
@@ -214,38 +301,15 @@ pub async fn backfill(
         if hits.is_empty() {
             break;
         }
-        let mut batch: Vec<EngineDoc> = Vec::with_capacity(hits.len());
         for hit in &hits {
-            let Some(source) = hit.get("_source") else {
-                continue;
-            };
-            let slug = hit
-                .get("_id")
-                .and_then(|i| i.as_str())
-                .or_else(|| source.get("slug").and_then(|s| s.as_str()))
-                .map(String::from);
-            let Some(slug) = slug.filter(|s| !s.is_empty()) else {
-                continue;
-            };
-            let mut doc = source.clone();
-            // The embedding travels as a float array in _source; pull it out
-            // (it is NOT part of the indexed doc payload — stored separately).
-            let embedding = doc.get("embedding").and_then(|e| e.as_array()).map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect::<Vec<f32>>()
-            });
-            if let Some(obj) = doc.as_object_mut() {
-                obj.remove("embedding");
+            if let Some(d) = hit_to_doc(hit) {
+                scanned += 1;
+                if let Some(full) = buf.push(d) {
+                    upserted += upsert_multi(pool, &full, force).await?;
+                    tracing::info!(scanned, upserted, "backfill progress (batch committed)");
+                }
             }
-            batch.push(EngineDoc {
-                slug,
-                doc,
-                embedding,
-            });
-            scanned += 1;
         }
-        upserted += upsert_batch(pool, &batch, force).await?;
         scroll_id = data
             .get("_scroll_id")
             .and_then(|s| s.as_str())
@@ -253,6 +317,16 @@ pub async fn backfill(
         if scroll_id.is_none() {
             break;
         }
+    }
+    // final partial batch — one last flush + commit
+    let rest = buf.take();
+    if !rest.is_empty() {
+        upserted += upsert_multi(pool, &rest, force).await?;
+        tracing::info!(
+            scanned,
+            upserted,
+            "backfill progress (final batch committed)"
+        );
     }
     if let Some(sid) = scroll_id {
         let _ = http
@@ -274,5 +348,115 @@ mod tests {
         let b = vec_to_bytes(&v);
         assert_eq!(b.len(), 16);
         assert_eq!(bytes_to_vec(&b), v);
+    }
+
+    fn edoc(slug: &str) -> EngineDoc {
+        EngineDoc {
+            slug: slug.into(),
+            doc: serde_json::json!({ "name": slug }),
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn batch_buffer_flushes_at_capacity() {
+        let mut buf = BatchBuffer::new(3);
+        assert!(buf.push(edoc("a")).is_none());
+        assert!(buf.push(edoc("b")).is_none());
+        let full = buf.push(edoc("c")).expect("flush at cap");
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0].slug, "a");
+        assert!(buf.is_empty());
+        // buffer restarts cleanly after a flush
+        assert!(buf.push(edoc("d")).is_none());
+        assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn batch_buffer_exact_multiple_of_capacity() {
+        // 6 docs, cap 3 → two full flushes, empty final take()
+        let mut buf = BatchBuffer::new(3);
+        let mut flushed = 0usize;
+        for i in 0..6 {
+            if buf.push(edoc(&format!("d{i}"))).is_some() {
+                flushed += 1;
+            }
+        }
+        assert_eq!(flushed, 2);
+        assert!(buf.take().is_empty());
+    }
+
+    #[test]
+    fn batch_buffer_final_partial_batch() {
+        // 5 docs, cap 3 → one full flush + partial take of 2
+        let mut buf = BatchBuffer::new(3);
+        let mut total = 0usize;
+        for i in 0..5 {
+            if let Some(full) = buf.push(edoc(&format!("d{i}"))) {
+                total += full.len();
+            }
+        }
+        assert_eq!(total, 3);
+        let rest = buf.take();
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].slug, "d3");
+        assert!(buf.take().is_empty());
+    }
+
+    #[test]
+    fn batch_buffer_chunks_across_scroll_pages() {
+        // scroll pages of 500 with cap 250 → full batches mid-page,
+        // never a flush per page boundary
+        let mut buf = BatchBuffer::new(250);
+        let mut batches = 0usize;
+        for p in 0..2 {
+            for i in 0..500 {
+                let d = edoc(&format!("p{p}-{i}"));
+                if buf.push(d).is_some() {
+                    batches += 1;
+                }
+            }
+        }
+        assert_eq!(batches, 4);
+        assert!(buf.take().is_empty());
+    }
+
+    #[test]
+    fn multi_upsert_sql_shape() {
+        let force = multi_upsert_sql(2, true);
+        assert!(force.starts_with(
+            "INSERT INTO catalog_documents (slug, doc, embedding) VALUES ($1, $2, $3),($4, $5, $6)"
+        ));
+        assert!(force.ends_with(
+            "ON CONFLICT (slug) DO UPDATE SET doc = EXCLUDED.doc, embedding = EXCLUDED.embedding, updated_at = now()"
+        ));
+        let skip = multi_upsert_sql(3, false);
+        assert!(skip.contains("($7, $8, $9)"));
+        assert!(skip.ends_with("ON CONFLICT (slug) DO NOTHING"));
+    }
+
+    #[test]
+    fn hit_to_doc_parses_id_and_extract_embedding() {
+        let hit = serde_json::json!({
+            "_id": "asics-sonicblast",
+            "_source": { "slug": "wrong", "name": "Shoe", "embedding": [1.0, 2.5] }
+        });
+        let d = hit_to_doc(&hit).expect("doc");
+        assert_eq!(d.slug, "asics-sonicblast");
+        assert_eq!(d.embedding, Some(vec![1.0f32, 2.5]));
+        assert!(d.doc.get("embedding").is_none(), "embedding stripped");
+        assert_eq!(d.doc["name"], "Shoe");
+    }
+
+    #[test]
+    fn hit_to_doc_falls_back_to_source_slug_and_skips_bad_hits() {
+        let hit = serde_json::json!({ "_source": { "slug": "from-source" } });
+        assert_eq!(hit_to_doc(&hit).expect("doc").slug, "from-source");
+        // no _source at all
+        assert!(hit_to_doc(&serde_json::json!({ "_id": "x" })).is_none());
+        // no usable id
+        assert!(hit_to_doc(&serde_json::json!({ "_source": { "name": "x" } })).is_none());
+        // empty id
+        assert!(hit_to_doc(&serde_json::json!({ "_id": "", "_source": {} })).is_none());
     }
 }

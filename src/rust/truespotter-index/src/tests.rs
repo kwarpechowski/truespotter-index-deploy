@@ -965,6 +965,7 @@ async fn unknown_clause_returns_400_shaped_error_via_api() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/:index/_search", post(crate::api::search_handler))
@@ -1008,6 +1009,68 @@ async fn unknown_clause_returns_400_shaped_error_via_api() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn health_reports_ready_flag() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    let e = engine();
+    let state = Arc::new(AppState {
+        engine: tokio::sync::RwLock::new(Arc::new(e)),
+        pool: None,
+        rebuild_secret: None,
+        write_lock: tokio::sync::Mutex::new(()),
+        scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
+    });
+    let app = Router::new()
+        .route("/health", get(crate::api::health_handler))
+        .with_state(state.clone());
+
+    // serve-first boot: listener up (200) but index not built yet
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["docs"], 12);
+    assert_eq!(v["ready"], false);
+
+    // after the initial build the flag flips (health stays 200 throughout)
+    state
+        .ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["ready"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn count_and_doc_endpoints() {
     use axum::body::Body;
     use axum::http::Request;
@@ -1023,6 +1086,7 @@ async fn count_and_doc_endpoints() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/:index/_count", get(crate::api::count_handler))
@@ -1390,6 +1454,7 @@ async fn refresh_mapping_mget_and_scroll_endpoints() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/:index/_search", post(crate::api::search_handler))

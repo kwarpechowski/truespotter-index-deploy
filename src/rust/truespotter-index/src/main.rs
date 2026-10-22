@@ -4,10 +4,15 @@
 //! OPENSEARCH_URL at this service — wire compatible, no code changes).
 //!
 //! Modes:
-//!   (default)   serve HTTP on PORT (8090) — builds the embedded index
-//!               from Postgres at boot (auto-rebuild when empty)
-//!   --backfill  [--force]  scroll the EXISTING OpenSearch (OPENSEARCH_URL)
-//!               and upsert docs + embeddings into catalog_documents
+//!   (default)   serve HTTP on PORT (8090) — SERVE-FIRST: the listener
+//!               binds and /health answers immediately; the index build
+//!               from Postgres runs in a background task and swaps in
+//!               atomically (/health reports ready=false until then)
+//!   --backfill  [--force]  serve, then scroll the EXISTING OpenSearch
+//!               (OPENSEARCH_URL) in the background and upsert docs +
+//!               embeddings into catalog_documents (resumable upserts)
+//!   --backfill-only  [--force]  one-off backfill without the server:
+//!               same flow, exits when done ("backfill complete")
 //!   --rebuild             rebuild the embedded index from Postgres
 //!   --healthcheck         GET /health self-probe (scratch image HEALTHCHECK)
 
@@ -86,11 +91,13 @@ async fn main() {
         }
     }
 
-    if args.contains(&"--backfill".into()) {
+    if args.contains(&"--backfill-only".into()) {
+        // One-off backfill without the server: the same flow the serve
+        // mode runs in the background — run it, log, exit.
         let db = config
             .database_url
             .clone()
-            .expect("DATABASE_URL is required for --backfill");
+            .expect("DATABASE_URL is required for --backfill-only");
         let pool = store::connect(&db).await.expect("connect postgres");
         store::ensure_table(&pool).await.expect("ensure table");
         let force = args.contains(&"--force".into());
@@ -134,7 +141,14 @@ async fn main() {
         return;
     }
 
-    serve(config).await;
+    // `--backfill` in serve mode: the server boots FIRST (healthcheck-safe),
+    // the initial index build + backfill run in the background.
+    serve(
+        config,
+        args.contains(&"--backfill".into()),
+        args.contains(&"--force".into()),
+    )
+    .await;
 }
 
 /// `--rebuild` standalone mode: load → build → report.
@@ -145,7 +159,100 @@ async fn engine_rebuild_standalone(pool: &sqlx::PgPool) -> Result<usize, String>
     engine::Engine::build(docs, data_dir).map(|_| n)
 }
 
-async fn serve(config: Config) {
+/// Background-backfill options (serve mode with `--backfill`).
+struct BackfillOpts {
+    url: String,
+    index: String,
+    user: Option<String>,
+    pass: Option<String>,
+    force: bool,
+}
+
+/// Serve-first boot task: (1) load all PG docs → build the embedded index
+/// (BM25 + vector matrix) → atomically swap into the serving engine and
+/// flip `ready`; (2) optionally run the OpenSearch backfill in the
+/// background. Neither phase may crash the server — a failed load leaves
+/// the empty index serving (ready=false), a failed backfill leaves the
+/// partial upserts in place (backfill is resumable — upserts).
+fn spawn_boot_builder(
+    state: Arc<api::AppState>,
+    pool: sqlx::PgPool,
+    data_dir: std::path::PathBuf,
+    backfill: Option<BackfillOpts>,
+) {
+    tokio::spawn(async move {
+        // phase 1 — initial index build from Postgres
+        let docs = match store::load_all(&pool).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "initial index load failed — serving empty index, /health stays ready=false"
+                );
+                return;
+            }
+        };
+        let n = docs.len();
+        let dd = data_dir.clone();
+        match tokio::task::spawn_blocking(move || engine::Engine::build(docs, Some(dd))).await {
+            Ok(Ok(built)) => {
+                *state.engine.write().await = Arc::new(built);
+                state
+                    .ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 {
+                    tracing::warn!(
+                        "catalog_documents is empty — serving an empty index; --backfill imports OpenSearch"
+                    );
+                }
+                tracing::info!(docs = n, "initial index build complete (ready)");
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    error = %e,
+                    "initial index build failed — serving empty index, /health stays ready=false"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "initial index build join failure — serving empty index, /health stays ready=false"
+                );
+                return;
+            }
+        }
+
+        // phase 2 — background backfill (resumable; failures never kill the server)
+        if let Some(bf) = backfill {
+            match store::backfill(
+                &pool,
+                &bf.url,
+                &bf.index,
+                bf.user.as_deref(),
+                bf.pass.as_deref(),
+                bf.force,
+            )
+            .await
+            {
+                Ok((upserted, scanned)) => {
+                    tracing::info!(upserted, scanned, "background backfill complete");
+                    // index the newly imported docs: the existing debounced
+                    // vector-rebuilder loop reloads from PG and swaps.
+                    state.mark_vectors_dirty();
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "background backfill failed — continuing to serve (upserts are resumable)"
+                    );
+                }
+            }
+        }
+    });
+}
+
+async fn serve(config: Config, backfill: bool, force: bool) {
     let Some(db_url) = config.database_url.clone() else {
         eprintln!("DATABASE_URL is required (Postgres catalog_documents is the source of truth)");
         std::process::exit(1);
@@ -162,47 +269,61 @@ async fn serve(config: Config) {
         std::process::exit(1);
     }
 
-    // Boot build: load PG docs → embedded index (auto-rebuild when the
-    // index is empty — it always is at boot; PG is the source of truth).
-    let docs = match store::load_all(&pool).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    let n_docs = docs.len();
+    // SERVE-FIRST: start with an empty engine. The real index (PG docs →
+    // BM25 + vector matrix) is built in a background task and swapped in
+    // atomically (the same Arc-swap /admin/rebuild uses). /health answers
+    // 200 with ready=false until the swap lands.
     let data_dir = config.data_dir.clone();
     let engine = match tokio::task::spawn_blocking(move || {
-        engine::Engine::build(docs, Some(data_dir))
+        engine::Engine::build(Vec::new(), Some(data_dir))
     })
     .await
     {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
-            eprintln!("embedded index build failed: {e}");
+            eprintln!("empty engine build failed: {e}");
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("embedded index build join failure: {e}");
+            eprintln!("empty engine build join failure: {e}");
             std::process::exit(1);
         }
     };
-    if n_docs == 0 {
-        tracing::warn!(
-            "catalog_documents is empty — serving an empty index; run --backfill to import OpenSearch"
-        );
-    }
-    tracing::info!(docs = n_docs, "embedded index ready");
 
     let state = Arc::new(api::AppState {
         engine: RwLock::new(Arc::new(engine)),
-        pool: Some(pool),
+        pool: Some(pool.clone()),
         rebuild_secret: config.rebuild_secret.clone(),
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
     });
+
+    // Initial index build (+ optional backfill) in the background — the
+    // listener below binds immediately, errors here never kill the server.
+    let backfill_opts = backfill.then(|| {
+        // explicit OPENSEARCH_URL is required for the background backfill
+        // (the Config default points at a compose-internal hostname).
+        non_empty("OPENSEARCH_URL").map(|_| BackfillOpts {
+            url: config.opensearch_url.clone(),
+            index: config.opensearch_index.clone(),
+            user: config.opensearch_user.clone(),
+            pass: config.opensearch_password.clone(),
+            force,
+        })
+    });
+    if backfill && backfill_opts.is_none() {
+        tracing::warn!(
+            "--backfill passed but OPENSEARCH_URL is not set — skipping background backfill"
+        );
+    }
+    spawn_boot_builder(
+        state.clone(),
+        pool,
+        config.data_dir.clone(),
+        backfill_opts.flatten(),
+    );
 
     // Background vector-matrix rebuild: writes mark the engine dirty; this
     // task debounces and rebuilds from Postgres (the brute-force kNN matrix

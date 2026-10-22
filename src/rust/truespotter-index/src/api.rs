@@ -37,12 +37,20 @@ pub struct AppState {
     /// set after every write — the background task rebuilds the vector
     /// matrix (full engine rebuild from Postgres) with debounce
     pub vectors_dirty: std::sync::atomic::AtomicBool,
+    /// false until the initial index build from Postgres finished
+    /// (serve-first boot: /health answers 200 immediately; `ready`
+    /// distinguishes "listener up" from "index built")
+    pub ready: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
     pub fn mark_vectors_dirty(&self) {
         self.vectors_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -378,7 +386,8 @@ pub async fn rebuild_handler(State(state): State<Arc<AppState>>, headers: Header
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
     let engine = state.engine.read().await.clone();
-    Json(json!({ "status": "ok", "docs": engine.num_docs() })).into_response()
+    Json(json!({ "status": "ok", "docs": engine.num_docs(), "ready": state.is_ready() }))
+        .into_response()
 }
 
 pub async fn root_handler() -> Response {
