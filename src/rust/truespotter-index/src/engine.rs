@@ -60,6 +60,11 @@ struct DocRec {
     genre: Option<String>,
     trust_score: Option<f64>,
     trust_count: Option<f64>,
+    /// Pre-computed function_score trust boost (spec
+    /// index-rs-trust-precompute W1): `(ts * ln(1+tc)).max(0)` when both
+    /// fields are present, else 0.0 (trust_score without trust_count →
+    /// ln(1) = 0). Evaluated once per write instead of per doc per query.
+    trust_boost: f64,
     /// epoch millis (doc ISO strings or epoch millis accepted)
     created_at: Option<i64>,
     /// the `id` doc field (external ref, e.g. "gid://shopify/…")
@@ -208,6 +213,23 @@ const PL_SYNONYMS: &[(&str, &str)] = &[
     ("kawa", "coffee"),
 ];
 
+/// Multi-word synonym pairs (spec index-rs-phrase-synonyms W1): an
+/// adjacent token sequence (the phrase) ↔ alternative tokens. FOLDED+
+/// STEMMED form ("zdalnego"→"zdaln", "sterowania"→"sterowan",
+/// "graficzna"→"graficzn", "grafika"→"grafik", "kawy"→"kaw").
+const PL_SYNONYM_PHRASES: &[(&[&str], &[&str])] = &[
+    (&["kart", "graficzn"], &["gpu", "grafik"]),
+    (&["ekspres", "do", "kaw"], &["ekspres"]),
+    (&["pilot", "zdaln", "sterowan"], &["pilot"]),
+];
+
+/// One member of a synonym group: a single term or an adjacent phrase
+/// (verified via tantivy PhraseQuery — adjacency strict, W3).
+enum GroupMember {
+    Term(String),
+    Phrase(Vec<String>),
+}
+
 fn synonyms_of(token: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (a, b) in PL_SYNONYMS {
@@ -220,19 +242,55 @@ fn synonyms_of(token: &str) -> Vec<String> {
     out
 }
 
-/// Group tokens with their synonyms: each group = [original, synonyms…].
-/// The GROUP is the msm unit (W3) — a doc matching any group member counts
-/// once, and `minimum_should_match` keeps its per-original-token semantics
-/// (expansion must not inflate the required count).
-fn expand_synonym_groups(tokens: Vec<String>) -> Vec<Vec<String>> {
-    tokens
-        .into_iter()
-        .map(|t| {
-            let mut g = vec![t.clone()];
-            g.extend(synonyms_of(&t));
-            g
-        })
-        .collect()
+/// Group tokens with their synonyms: each group is one msm UNIT — a doc
+/// matching any group member counts once, and `minimum_should_match`
+/// keeps its per-original-token semantics (expansion must not inflate
+/// the required count). A matched multi-word phrase MERGES its token
+/// positions into ONE group (W2 — semantically one concept).
+fn expand_synonym_groups(tokens: Vec<String>) -> Vec<Vec<GroupMember>> {
+    let mut groups: Vec<Vec<GroupMember>> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        // longest phrase match at the current position (greedy, W2)
+        let mut matched: Option<(usize, usize)> = None;
+        for (pi, (phrase, _alts)) in PL_SYNONYM_PHRASES.iter().enumerate() {
+            let len = phrase.len();
+            if i + len <= tokens.len()
+                && matched.is_none_or(|(_, l)| len > l)
+                && phrase.iter().zip(&tokens[i..i + len]).all(|(p, t)| p == t)
+            {
+                matched = Some((pi, len));
+            }
+        }
+        if let Some((pi, len)) = matched {
+            let (phrase, alts) = &PL_SYNONYM_PHRASES[pi];
+            let mut g = vec![GroupMember::Phrase(
+                phrase.iter().map(|s| s.to_string()).collect(),
+            )];
+            for a in alts.iter() {
+                g.push(GroupMember::Term((*a).to_string()));
+            }
+            groups.push(g);
+            i += len;
+            continue;
+        }
+        // single token: original + single-token synonyms + reverse
+        // phrases (queries containing an alternative also match docs
+        // with the full phrase)
+        let t = &tokens[i];
+        let mut g = vec![GroupMember::Term(t.clone())];
+        g.extend(synonyms_of(t).into_iter().map(GroupMember::Term));
+        for (phrase, alts) in PL_SYNONYM_PHRASES {
+            if alts.iter().any(|a| a == t) {
+                g.push(GroupMember::Phrase(
+                    phrase.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+        }
+        groups.push(g);
+        i += 1;
+    }
+    groups
 }
 
 // ---------------------------------------------------------------------------
@@ -657,6 +715,11 @@ fn extract_rec(slug: &str, doc: &Value) -> DocRec {
         genre: doc.get("genre").and_then(|g| g.as_str()).map(String::from),
         trust_score: get_f64(doc, "trust_score"),
         trust_count: get_f64(doc, "trust_count"),
+        // W1 (spec index-rs-trust-precompute): computed once at write
+        trust_boost: match (get_f64(doc, "trust_score"), get_f64(doc, "trust_count")) {
+            (Some(ts), Some(tc)) => (ts * (1.0f64 + tc).ln()).max(0.0),
+            _ => 0.0,
+        },
         created_at: doc.get("created_at").and_then(parse_created_at),
         external_id: doc.get("id").and_then(|i| i.as_str()).map(String::from),
         deleted: false,
@@ -1013,15 +1076,9 @@ impl Engine {
                     let mut s = score;
                     if use_script {
                         // The recognized trust script: trust_score * ln1p(trust_count)
-                        // (Math.log1p(x) = ln(1+x)), floored at 0 — evaluated
-                        // natively, boost_mode sum.
-                        let records = self.recs();
-                        let rec = &records[docno];
-                        let trust = match (rec.trust_score, rec.trust_count) {
-                            (Some(ts), Some(tc)) => (ts * (1.0f64 + tc).ln()).max(0.0),
-                            (Some(ts), None) => (ts * (1.0f64 + 0.0).ln()).max(0.0),
-                            _ => 0.0,
-                        };
+                        // — evaluated natively, boost_mode sum. Pre-computed at
+                        // write time (spec index-rs-trust-precompute W2).
+                        let trust = self.recs()[docno].trust_boost;
                         s = if *boost_mode_sum {
                             s + trust
                         } else {
@@ -1302,10 +1359,14 @@ impl Engine {
             expand_synonym_groups(tokens)
                 .iter()
                 .map(|group| {
-                    // union over the group members (original + synonyms)
+                    // union over the group members (terms + phrases)
                     let mut m = BTreeMap::new();
-                    for token in group {
-                        for (doc, s) in self.term_scores(field, token) {
+                    for member in group {
+                        let pairs = match member {
+                            GroupMember::Term(t) => self.term_scores(field, t),
+                            GroupMember::Phrase(toks) => self.phrase_scores(field, toks),
+                        };
+                        for (doc, s) in pairs {
                             *m.entry(doc).or_insert(0.0) += s;
                         }
                     }
@@ -1348,6 +1409,18 @@ impl Engine {
             }
         }
         "title"
+    }
+
+    /// All (docno, bm25) pairs for an adjacent phrase in a text field
+    /// (spec index-rs-phrase-synonyms W3 — extracted from the
+    /// eval_phrase body pattern; multi-token phrases only).
+    fn phrase_scores(&self, field: Field, tokens: &[String]) -> Vec<(usize, f64)> {
+        let searcher = self.searcher();
+        let limit = searcher.num_docs() as usize + 1;
+        let hits = searcher
+            .search(&phrase_query(tokens, field), &TopDocs::with_limit(limit))
+            .unwrap_or_default();
+        self.docnos(&hits, &searcher)
     }
 
     /// match_phrase (and match_phrase_prefix when `prefix`).
@@ -1468,7 +1541,7 @@ impl Engine {
     fn eval_text_match_with_msm(
         &self,
         field: &str,
-        groups: &[Vec<String>],
+        groups: &[Vec<GroupMember>],
         operator: Operator,
         msm: &Option<Msm>,
     ) -> BTreeMap<usize, f64> {
@@ -1490,10 +1563,14 @@ impl Engine {
         let mut matched_counts: BTreeMap<usize, usize> = BTreeMap::new();
         let mut sums: BTreeMap<usize, f64> = BTreeMap::new();
         for group in groups {
-            // union over the group members (original + synonyms)
+            // union over the group members (terms + phrases)
             let mut m: BTreeMap<usize, f64> = BTreeMap::new();
-            for token in group {
-                for (doc, s) in self.term_scores(tfield, token) {
+            for member in group {
+                let pairs = match member {
+                    GroupMember::Term(t) => self.term_scores(tfield, t),
+                    GroupMember::Phrase(toks) => self.phrase_scores(tfield, toks),
+                };
+                for (doc, s) in pairs {
                     *m.entry(doc).or_insert(0.0) += s;
                 }
             }
@@ -2090,6 +2167,7 @@ impl Engine {
             genre: None,
             trust_score: None,
             trust_count: None,
+            trust_boost: 0.0,
             created_at: None,
             external_id: None,
             deleted: true,

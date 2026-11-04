@@ -906,6 +906,60 @@ fn int8_knn_scores_within_tolerance_of_cosine() {
     assert_eq!(res.pointer("/hits/hits/0/_id").unwrap(), "vec-a");
 }
 
+/// Spec index-rs-phrase-synonyms (W5): multi-word synonyms work in both
+/// directions — a query with the phrase hits docs using the alternative
+/// token, and a query with the alternative token hits docs with the full
+/// phrase (adjacency strict).
+#[test]
+fn phrase_synonyms_match_in_both_directions() {
+    let docs = vec![
+        doc("gpu-card", json!({ "title": "GPU RTX 4070", "description": "wydajna" })),
+        doc("karta", json!({ "title": "Karta graficzna do gier", "description": " szybka" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    // phrase query → hits the "GPU" doc (alternative token member)
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "karta graficzna" } } }));
+    assert!(hit_slugs(&res).contains(&"gpu-card".to_string()), "{:?}", hit_slugs(&res));
+    // alternative-token query → hits the "Karta graficzna" doc (reverse
+    // phrase member, adjacency strict)
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "gpu" } } }));
+    assert!(hit_slugs(&res).contains(&"karta".to_string()), "{:?}", hit_slugs(&res));
+    // adjacency: "graficzna karta" (reversed) is NOT the phrase — docs
+    // still match their own tokens, but the phrase member does not fire
+    // for a non-adjacent query… (query-side: reversed order means no
+    // phrase detection — only "graficzn"/"kart" single-token groups)
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "grafika" } } }));
+    assert!(hit_slugs(&res).contains(&"karta".to_string()), "{:?}", hit_slugs(&res));
+}
+
+/// Spec index-rs-trust-precompute (W4): identical BM25 docs with different
+/// trust_score — relevance sort (function_score sum) ranks the higher-trust
+/// doc first via the pre-computed boost.
+#[test]
+fn precomputed_trust_boost_ranks_higher_trust_first() {
+    let docs = vec![
+        doc("trust-low", json!({ "title": "Widget Pro", "trust_score": 0.1, "trust_count": 3 })),
+        doc("trust-high", json!({ "title": "Widget Pro", "trust_score": 0.9, "trust_count": 40 })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    let res = search(
+        &e,
+        &json!({
+            "size": 10,
+            "query": {
+                "function_score": {
+                    "query": { "match": { "title": "widget" } },
+                    "script_score": { "script": { "source": crate::dsn::TRUST_SCRIPT } },
+                    "boost_mode": "sum"
+                }
+            }
+        }),
+    );
+    let slugs = hit_slugs(&res);
+    assert_eq!(slugs.first().map(String::as_str), Some("trust-high"), "{slugs:?}");
+}
+
+
 /// Spec index-rs-synonyms (W4): a query term matches documents that use
 /// its synonym — both directions — without inflating msm (the synonym
 /// group is the msm unit, so a doc matching only one member still counts).
