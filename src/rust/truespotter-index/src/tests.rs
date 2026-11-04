@@ -850,6 +850,62 @@ fn polish_stemming_matches_inflections() {
 }
 
 
+/// Spec index-rs-int8-quantization (W5): i8-quantized kNN scores stay
+/// within 1% of the exact f32 cosine, and ranking is preserved.
+#[test]
+fn int8_knn_scores_within_tolerance_of_cosine() {
+    let raw_a = [0.3, 0.5, 0.8, 0.2];
+    let raw_b = [0.2, 0.4, 0.9, 0.1];
+    let mut docs = vec![
+        doc("vec-a", json!({ "title": "A", "embedding": raw_a.to_vec() })),
+        doc("vec-b", json!({ "title": "B", "embedding": raw_b.to_vec() })),
+    ];
+    for d in docs.iter_mut() {
+        d.embedding = d
+            .doc
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            });
+    }
+    let e = Engine::build(docs, None).expect("build engine");
+    let query = [0.1, 0.3, 0.7, 0.4];
+    let res = search(
+        &e,
+        &json!({
+            "size": 5,
+            "query": { "bool": { "must": [ { "knn": { "embedding": { "vector": query.to_vec(), "k": 2 } } } ] } }
+        }),
+    );
+    // exact f64 cosine reference
+    let cos = |x: &[f64], y: &[f64]| -> f64 {
+        let dot: f64 = x.iter().zip(y).map(|(a, b)| a * b).sum();
+        let nx: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let ny: f64 = y.iter().map(|v| v * v).sum::<f64>().sqrt();
+        dot / (nx * ny)
+    };
+    for hit in res.pointer("/hits/hits").unwrap().as_array().unwrap() {
+        let slug = hit["_id"].as_str().unwrap();
+        let row: Vec<f64> = if slug == "vec-a" {
+            raw_a.iter().map(|f| *f as f64).collect()
+        } else {
+            raw_b.iter().map(|f| *f as f64).collect()
+        };
+        let expected = (1.0 + cos(&query.iter().map(|f| *f as f64).collect::<Vec<_>>(), &row)) / 2.0;
+        let got = hit["_score"].as_f64().unwrap();
+        assert!(
+            (got - expected).abs() < 0.01,
+            "{slug}: int8 score {got} within 1% of f32 cosine {expected}"
+        );
+    }
+    // ranking preserved: a (closer to the query direction, cos 0.938 vs
+    // b's 0.926) ranks first — identical to the f32 ranking
+    assert_eq!(res.pointer("/hits/hits/0/_id").unwrap(), "vec-a");
+}
+
 /// Spec index-rs-synonyms (W4): a query term matches documents that use
 /// its synonym — both directions — without inflating msm (the synonym
 /// group is the msm unit, so a doc matching only one member still counts).
@@ -1408,12 +1464,20 @@ fn update_doc_as_upsert_searches_immediately_and_preserves_embedding() {
         &json!({ "query": { "multi_match": { "query": "sonicblast pro", "fields": ["title^3", "vendor"] } } }),
     );
     assert!(hit_slugs(&data).contains(&"asics-sonicblast".to_string()));
-    // the stored embedding survived the merge — in its W2-normalized
-    // stored form (spec index-rs-optimization: rows are unit-length so
-    // the kNN scan is a plain dot product; direction preserved)
+    // the stored embedding survived the merge — in its normalized+int8
+    // DEQUANTIZED stored form (spec index-rs-int8-quantization W3: rows
+    // are unit-length i8-quantized; get_doc returns the approximate
+    // reconstruction, direction preserved within ~1%)
     let (_, emb) = e.get_doc("asics-sonicblast").unwrap();
     let expected = crate::engine::l2_normalize(&[0.1, 0.2, 0.3]);
-    assert_eq!(emb, Some(expected));
+    let emb = emb.expect("embedding preserved");
+    assert_eq!(emb.len(), expected.len());
+    for (a, b) in emb.iter().zip(expected.iter()) {
+        assert!(
+            (a - b).abs() < 0.01,
+            "dequantized embedding within 1% of the normalized original: {emb:?} vs {expected:?}"
+        );
+    }
     // _doc GET reflects the merged field
     let src = e.get_by_id("asics-sonicblast").unwrap();
     assert_eq!(src["title"], "ASICS Sonicblast PRO");

@@ -289,18 +289,21 @@ impl TokenStream for TsTokenStream {
 }
 
 // ---------------------------------------------------------------------------
-// Vector store — brute-force kNN over a raw LE f32 matrix. Persisted to
-// /data/vectors.f32 and mmap'd read-only (RAM budget); in-RAM fallback
-// when /data is unavailable. 29k × 4096-dim ≈ 10–50 ms per query
-// (spec-approved LanceDB fallback).
+// Vector store — brute-force kNN over an int8-quantized matrix. Persisted
+// to /data/vectors.f32 and mmap'd read-only (RAM budget); in-RAM fallback
+// when /data is unavailable. Rows are L2-normalized (W2) + symmetrically
+// quantized per-vector to i8 (spec index-rs-int8-quantization): 4× less
+// memory and scan bandwidth than f32 at ≤1% cosine error.
 // ---------------------------------------------------------------------------
 
-/// Persisted-matrix header magic ("TSIN" LE) — W2 (spec
-/// index-rs-optimization): guards the normalized-vector format. Files
-/// written by pre-W2 builds start with the dim u32 instead and are
-/// ignored (the build always rewrites the file fresh from PG rows).
+/// Persisted-matrix header magic ("TSIN" LE) — guards the binary format.
+/// Files written by older builds (pre-W2 no header; v2 f32) start with a
+/// dim u32 / v2 marker instead and are ignored (the build always rewrites
+/// the file fresh from PG rows).
 const VECTORS_MAGIC: u32 = 0x5453_494E;
-const VECTORS_VERSION: u32 = 2;
+/// v3: header (magic, version, dim, n) + n×f32 per-row scales +
+/// n×dim×i8 quantized matrix.
+const VECTORS_VERSION: u32 = 3;
 
 /// L2-normalize a vector (W2): stored embeddings are unit-length so the
 /// kNN scan is a plain dot product (one pass instead of three). A
@@ -315,16 +318,39 @@ pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
+/// Symmetric per-vector int8 quantization (W1): scale = max|x|, values
+/// clamp to [-127, 127]. Zero vectors get an all-zero row and scale 0.0
+/// (dot = 0 → neutral score 0.5, same semantics as before).
+fn quantize_row(v: &[f32]) -> (Vec<i8>, f32) {
+    let scale = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    if scale <= 0.0 {
+        return (vec![0i8; v.len()], 0.0);
+    }
+    let q = v
+        .iter()
+        .map(|x| (x / scale * 127.0).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (q, scale)
+}
+
+/// Approximate dequantization (`x = q/127 * scale`, W3) — used only by
+/// `get_doc`'s embedding return; every production call site discards it.
+fn dequantize_row(q: &[i8], scale: f32) -> Vec<f32> {
+    q.iter().map(|c| *c as f32 / 127.0 * scale).collect()
+}
+
 enum VectorStore {
     Empty,
     Ram {
-        data: Vec<f32>,
+        data: Vec<i8>,
+        scales: Vec<f32>,
         n: usize,
         dim: usize,
         has_vec: Vec<bool>,
     },
     Mmap {
         map: memmap2::Mmap,
+        scales: Vec<f32>,
         n: usize,
         dim: usize,
         has_vec: Vec<bool>,
@@ -347,28 +373,33 @@ impl VectorStore {
             .iter()
             .map(|e| e.as_ref().is_some_and(|v| v.len() == dim))
             .collect();
-        let mut data = vec![0f32; n * dim];
+        // W1 (spec index-rs-int8-quantization): normalize (W2) then
+        // quantize each row symmetrically to i8 with a per-row scale.
+        let mut data = vec![0i8; n * dim];
+        let mut scales = vec![0f32; n];
         for (i, e) in embeddings.iter().enumerate() {
             if let Some(e) = e.as_ref().filter(|e| e.len() == dim) {
-                // W2: rows are stored L2-normalized — the kNN scan is a
-                // plain dot product.
                 let normed = l2_normalize(e);
-                data[i * dim..(i + 1) * dim].copy_from_slice(&normed);
+                let (q, s) = quantize_row(&normed);
+                data[i * dim..(i + 1) * dim].copy_from_slice(&q);
+                scales[i] = s;
             }
         }
         if let Some(dir) = dir {
             let path = dir.join("vectors.f32");
-            let mut buf: Vec<u8> = Vec::with_capacity(16 + data.len() * 4);
+            // v3 layout: 16-byte header + n×f32 scales + n×dim×i8 matrix
+            let mut buf: Vec<u8> = Vec::with_capacity(16 + n * 4 + data.len());
             buf.extend_from_slice(&VECTORS_MAGIC.to_le_bytes());
             buf.extend_from_slice(&VECTORS_VERSION.to_le_bytes());
             buf.extend_from_slice(&(dim as u32).to_le_bytes());
             buf.extend_from_slice(&(n as u32).to_le_bytes());
-            for f in &data {
-                buf.extend_from_slice(&f.to_le_bytes());
+            for s in &scales {
+                buf.extend_from_slice(&s.to_le_bytes());
             }
+            buf.extend(data.iter().map(|b| *b as u8));
             if fs::create_dir_all(dir).is_ok() && fs::write(&path, &buf).is_ok() {
                 if let Ok(bytes) = fs::read(&path) {
-                    if bytes.len() >= 16 {
+                    if bytes.len() >= 16 + n * 4 + n * dim {
                         let fmagic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
                         let fversion = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                         let fdim = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -381,14 +412,20 @@ impl VectorStore {
                             if let Ok(map) = unsafe { memmap2::Mmap::map(&path_as_file(&path)) } {
                                 // Spec index-rs-knn-warm-start W1: fault in
                                 // ALL pages NOW — the first kNN query after
-                                // boot would otherwise pay ~10s of volume
-                                // reads on the 650 MB matrix (prod measured
-                                // 2026-11-04). One touch per 4K page;
-                                // best-effort, never fails the build (W3).
+                                // boot would otherwise pay seconds of volume
+                                // reads on the matrix (prod measured 10.4 s
+                                // pre-int8, 2026-11-04). One touch per 4K
+                                // page; best-effort, never fails the build.
                                 let sum: u64 = map.chunks(4096).map(|c| c[0] as u64).sum();
                                 std::hint::black_box(sum);
+                                // scales live in RAM (n × 4 B — tiny)
+                                let scales: Vec<f32> = bytes[16..16 + n * 4]
+                                    .chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                                    .collect();
                                 return VectorStore::Mmap {
                                     map,
+                                    scales,
                                     n,
                                     dim,
                                     has_vec,
@@ -402,6 +439,7 @@ impl VectorStore {
         }
         VectorStore::Ram {
             data,
+            scales,
             n,
             dim,
             has_vec,
@@ -417,26 +455,36 @@ impl VectorStore {
         }
     }
 
-    /// Owned copy for the write path (partial-update "keep embedding").
+    /// Owned (approximately dequantized) copy for the write path
+    /// (partial-update "keep embedding", W3).
     fn row_vec(&self, i: usize) -> Option<Vec<f32>> {
-        self.row(i).map(|r| r.to_vec())
+        let (q, scale) = self.row8(i)?;
+        Some(dequantize_row(q, scale))
     }
 
-    fn row(&self, i: usize) -> Option<&[f32]> {
-        // i can exceed the build-time matrix (docs upserted after build —
-        // their vectors live in pending_vectors, not the matrix)
+    /// Quantized row + its scale. `i` can exceed the build-time matrix
+    /// (docs upserted after build — their vectors live in pending_vectors,
+    /// not the matrix).
+    fn row8(&self, i: usize) -> Option<(&[i8], f32)> {
         if i >= self.len() {
             return None;
         }
         match self {
             VectorStore::Empty => None,
-            VectorStore::Ram { data, dim, .. } => Some(&data[i * dim..(i + 1) * dim]),
-            VectorStore::Mmap { map, dim, .. } => {
-                // 16-byte header: magic + version + dim + n (W2)
-                let off = (i * dim) * 4 + 16;
-                let bytes = &map[off..off + dim * 4];
-                // Safety-free view: copy is avoided by transmute-free re-reading below.
-                Some(vector_slice(bytes, *dim))
+            VectorStore::Ram {
+                data, scales, dim, ..
+            } => Some((&data[i * dim..(i + 1) * dim], scales[i])),
+            VectorStore::Mmap {
+                map,
+                scales,
+                n,
+                dim,
+                ..
+            } => {
+                // v3 layout: 16-byte header + n×f32 scales, then the i8 matrix
+                let off = 16 + n * 4 + i * dim;
+                let bytes = &map[off..off + dim];
+                Some((i8_slice(bytes, *dim), scales[i]))
             }
         }
     }
@@ -449,11 +497,10 @@ impl VectorStore {
     }
 }
 
-/// Reinterpret a LE f32 byte slice without copying.
-fn vector_slice(bytes: &[u8], dim: usize) -> &[f32] {
-    // SAFETY-backed via memmap2's as_ptr; validated length by caller.
-    assert_eq!(bytes.len(), dim * 4);
-    let ptr = bytes.as_ptr() as *const f32;
+/// Reinterpret a byte slice as the i8 quantized row (no copy).
+fn i8_slice(bytes: &[u8], dim: usize) -> &[i8] {
+    assert_eq!(bytes.len(), dim);
+    let ptr = bytes.as_ptr() as *const i8;
     unsafe { std::slice::from_raw_parts(ptr, dim) }
 }
 
@@ -1485,12 +1532,14 @@ impl Engine {
                 vector.len()
             ));
         }
-        // W2 (spec index-rs-optimization): stored rows are L2-normalized at
-        // write time, so cosine collapses to a plain dot product — ONE pass
-        // per row instead of three (dot + two norms). The query vector is
-        // normalized here (client embeddings are usually unit-length, but
-        // don't rely on it — scale must not change ranking).
+        // W2 (spec index-rs-optimization): the query is L2-normalized so
+        // cosine collapses to a plain dot product. Pending rows are f32
+        // (small sidecar) — dotted in f32 below.
         let q = l2_normalize(vector);
+        // W1/W2 (spec index-rs-int8-quantization): quantize the query to
+        // i8 as well — the scan is an i8×i8 integer dot with i32
+        // accumulation, rescaled by the per-row/query scales.
+        let (q8, s_q) = quantize_row(&q);
         // pending upserts override their (stale) matrix row until the next
         // full rebuild swaps in a fresh Engine
         let pending = self
@@ -1508,12 +1557,13 @@ impl Engine {
                 if !has_vec[i] || pending.contains_key(&i) {
                     return f32::NEG_INFINITY;
                 }
-                let row = self.vectors.row(i).expect("row present");
-                let mut dot = 0f32;
+                let (r8, s_r) = self.vectors.row8(i).expect("row present");
+                let mut acc: i32 = 0;
                 for j in 0..dim {
-                    dot += q[j] * row[j];
+                    acc += q8[j] as i32 * r8[j] as i32;
                 }
-                dot
+                // 127² = 16129; clamp guards rounding overshoot
+                (acc as f32 * s_q * s_r / 16129.0).clamp(-1.0, 1.0)
             })
             .collect();
         let mut scored: Vec<(usize, f32)> = scores
