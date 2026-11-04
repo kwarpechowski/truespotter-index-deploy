@@ -906,6 +906,64 @@ fn int8_knn_scores_within_tolerance_of_cosine() {
     assert_eq!(res.pointer("/hits/hits/0/_id").unwrap(), "vec-a");
 }
 
+/// Spec index-rs-dynamic-synonyms (W4/W7): the dictionary is hot-swappable
+/// — a freshly set dict takes effect on the very next query, no rebuild.
+#[test]
+fn synonym_dict_hot_swap_applies_to_next_query() {
+    let docs = vec![
+        doc("kawa", json!({ "title": "Kawa ziarnista" })),
+        doc("czajnik", json!({ "title": "Czajnik" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    // no dict — "coffee" matches nothing
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "coffee" } } }));
+    assert!(hit_slugs(&res).is_empty(), "{:?}", hit_slugs(&res));
+    // hot-swap in a pair — immediately effective
+    e.set_synonyms(crate::engine::SynonymDict::from_raw([
+        (vec!["kawa".into()], vec!["coffee".into()]),
+    ]));
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "coffee" } } }));
+    assert!(hit_slugs(&res).contains(&"kawa".to_string()), "{:?}", hit_slugs(&res));
+}
+
+/// Spec index-rs-llm-synonym-mining: the LLM answer parser accepts a bare
+/// JSON object (fences tolerated), validates sides (1-4 words, alnum) and
+/// drops self-synonyms (same stem sequence).
+#[test]
+fn llm_pair_parser_validates_and_filters() {
+    let content = r#"```json
+{"pairs": [["kawa", "coffee"], ["kawa", "herbata zbożowa"], ["czajnik", "czajnik"], ["kawa", "a"], ["pralka", "P,RL.KA"]]}
+```"#;
+    let pairs = crate::synonym_gen::parse_llm_pairs(content, "kawa");
+    assert_eq!(pairs.len(), 2, "{pairs:?}");
+    assert_eq!(pairs[0], (vec!["kawa".to_string()], vec!["coffee".to_string()]));
+    // self-synonym (same stems) dropped; too-short side dropped; punctuation dropped
+    let from_raw = crate::engine::SynonymDict::from_raw(pairs);
+    assert_eq!(from_raw.len(), 2);
+    // garbage → empty, never a panic
+    assert!(crate::synonym_gen::parse_llm_pairs("kawa to kawa", "kawa").is_empty());
+}
+
+/// Spec index-rs-dynamic-synonyms (W7): raw (diacritic) rule words stem at
+/// load — "słuchawki" and "sluchawki" queries both hit the same pair.
+#[test]
+fn synonym_dict_stems_raw_words_at_load() {
+    let docs = vec![
+        doc("sluch", json!({ "title": "Słuchawki bezprzewodowe" })),
+        doc("hp", json!({ "title": "Headphones HP" })),
+    ];
+    let dict = crate::engine::SynonymDict::from_raw([
+        (vec!["słuchawki".into()], vec!["headphones".into()]),
+    ]);
+    let e = Engine::build_with_synonyms(docs, None, dict).expect("build engine");
+    // "headphones" query hits the Słuchawki doc (query also stems/folds)
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "headphones" } } }));
+    assert!(hit_slugs(&res).contains(&"sluch".to_string()), "{:?}", hit_slugs(&res));
+    // and the reverse direction with diacritics folded in the query
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "sluchawki" } } }));
+    assert!(hit_slugs(&res).contains(&"hp".to_string()), "{:?}", hit_slugs(&res));
+}
+
 /// Spec index-rs-phrase-synonyms (W5): multi-word synonyms work in both
 /// directions — a query with the phrase hits docs using the alternative
 /// token, and a query with the alternative token hits docs with the full
@@ -916,7 +974,13 @@ fn phrase_synonyms_match_in_both_directions() {
         doc("gpu-card", json!({ "title": "GPU RTX 4070", "description": "wydajna" })),
         doc("karta", json!({ "title": "Karta graficzna do gier", "description": " szybka" })),
     ];
-    let e = Engine::build(docs, None).expect("build engine");
+    let dict = crate::engine::SynonymDict::from_raw([
+        // a multi-token side is an adjacent PHRASE; alternatives are
+        // SEPARATE rules (same convention as the PG seed)
+        (vec!["karta".into(), "graficzna".into()], vec!["gpu".into()]),
+        (vec!["karta".into(), "graficzna".into()], vec!["grafika".into()]),
+    ]);
+    let e = Engine::build_with_synonyms(docs, None, dict).expect("build engine");
     // phrase query → hits the "GPU" doc (alternative token member)
     let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "karta graficzna" } } }));
     assert!(hit_slugs(&res).contains(&"gpu-card".to_string()), "{:?}", hit_slugs(&res));
@@ -971,7 +1035,13 @@ fn synonyms_expand_match_queries_bidirectionally() {
         doc("obuwie", json!({ "title": "Obuwie sportowe", "description": "dobre" })),
         doc("buty", json!({ "title": "Buty do biegania", "description": "szybkie" })),
     ];
-    let e = Engine::build(docs, None).expect("build engine");
+    // spec index-rs-dynamic-synonyms: the dictionary is DATA — injected
+    // like the PG loader would (raw words, stemmed at load)
+    let dict = crate::engine::SynonymDict::from_raw([
+        (vec!["buty".into()], vec!["obuwie".into()]),
+        (vec!["smartfon".into()], vec!["telefon".into()]),
+    ]);
+    let e = Engine::build_with_synonyms(docs, None, dict).expect("build engine");
     // "smartfon" query → hits the doc titled "Telefon"
     let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "smartfon" } } }));
     assert!(hit_slugs(&res).contains(&"telefon".to_string()), "{:?}", hit_slugs(&res));

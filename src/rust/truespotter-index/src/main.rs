@@ -20,6 +20,7 @@ mod api;
 mod dsn;
 mod engine;
 mod store;
+mod synonym_gen;
 mod write;
 
 #[cfg(test)]
@@ -156,7 +157,11 @@ async fn engine_rebuild_standalone(pool: &sqlx::PgPool) -> Result<usize, String>
     let docs = store::load_all(pool).await?;
     let n = docs.len();
     let data_dir = std::env::var("DATA_DIR").map(std::path::PathBuf::from).ok();
-    engine::Engine::build(docs, data_dir).map(|_| n)
+    let synonyms = store::load_synonym_dict(pool).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "synonym dict load failed — building without");
+        engine::SynonymDict::empty()
+    });
+    engine::Engine::build_with_synonyms(docs, data_dir, synonyms).map(|_| n)
 }
 
 /// Background-backfill options (serve mode with `--backfill`).
@@ -194,7 +199,15 @@ fn spawn_boot_builder(
         };
         let n = docs.len();
         let dd = data_dir.clone();
-        match tokio::task::spawn_blocking(move || engine::Engine::build(docs, Some(dd))).await {
+        let synonyms = store::load_synonym_dict(&pool).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "synonym dict load failed — building without");
+            engine::SynonymDict::empty()
+        });
+        match tokio::task::spawn_blocking(move || {
+            engine::Engine::build_with_synonyms(docs, Some(dd), synonyms)
+        })
+        .await
+        {
             Ok(Ok(built)) => {
                 *state.engine.write().await = Arc::new(built);
                 state
@@ -330,10 +343,25 @@ async fn serve(config: Config, backfill: bool, force: bool) {
     // is not updated incrementally — a full rebuild takes seconds at 29k).
     spawn_vector_rebuilder(state.clone(), config.data_dir.clone());
 
+    // LLM synonym mining (spec index-rs-llm-synonym-mining): mines the
+    // title vocabulary, asks GLM for pairs, caches into synonym_rules and
+    // hot-swaps the dictionary. No-op when LLM_* is not configured.
+    synonym_gen::spawn(state.clone());
+
     let app = Router::new()
         .route("/", get(api::root_handler))
         .route("/health", get(api::health_handler))
         .route("/admin/rebuild", post(api::rebuild_handler))
+        .route("/:index/_synonyms", get(api::synonyms_list_handler))
+        .route("/:index/_synonyms", post(api::synonyms_insert_handler))
+        .route(
+            "/:index/_synonyms/_reload",
+            post(api::synonyms_reload_handler),
+        )
+        .route(
+            "/:index/_synonyms/:id",
+            axum::routing::delete(api::synonyms_delete_handler),
+        )
         .route("/:index/_search", post(api::search_handler))
         .route(
             "/_search/scroll",
@@ -415,10 +443,15 @@ fn spawn_vector_rebuilder(state: Arc<api::AppState>, data_dir: std::path::PathBu
             };
             let n = docs.len();
             let dd = data_dir.clone();
-            let built =
-                match tokio::task::spawn_blocking(move || engine::Engine::build(docs, Some(dd)))
-                    .await
-                {
+            let synonyms = store::load_synonym_dict(&pool).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "synonym dict load failed — building without");
+                engine::SynonymDict::empty()
+            });
+            let built = match tokio::task::spawn_blocking(move || {
+                engine::Engine::build_with_synonyms(docs, Some(dd), synonyms)
+            })
+            .await
+            {
                     Ok(Ok(e)) => e,
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "vector rebuild failed");

@@ -166,7 +166,7 @@ const PL_SUFFIXES: [&str; 22] = [
 /// without a known ending and stems that would get too short pass through
 /// unchanged. Over-stemming hurts precision only — the same function
 /// tokenizes index and query, so recall never breaks.
-fn stem_pl(word: &str) -> &str {
+pub(crate) fn stem_pl(word: &str) -> &str {
     let mut w = word;
     for _ in 0..2 {
         let mut stripped = w;
@@ -189,39 +189,50 @@ fn stem_pl(word: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// Synonyms (spec index-rs-synonyms) — query-time expansion for
-// match/multi_match. Pairs are in FOLDED+STEMMED form (the same space
-// `folded_tokens` produces). Bidirectional at lookup: expanding the QUERY
-// token covers both directions (query "telefon" hits docs with "smartfon"
-// and vice versa) without touching the index side.
+// Synonym dictionary (specs index-rs-dynamic-synonyms +
+// index-rs-llm-synonym-mining) — query-time expansion for
+// match/multi_match. DATA, not code: loaded from the synonym_rules table
+// (the durable cache for admin-curated AND LLM-generated pairs), held in
+// RAM behind an RwLock, hot-swappable without a rebuild.
+//
+// Every term is stored RAW (with diacritics) and stemmed at load through
+// fold_str + stem_pl — the single source of truth for the term space —
+// so index and query semantics match by construction. A rule side is a
+// token SEQUENCE: len 1 -> Term, len > 1 -> adjacent Phrase.
 // ---------------------------------------------------------------------------
 
-const PL_SYNONYMS: &[(&str, &str)] = &[
-    ("but", "obuw"),
-    ("smartfon", "telefon"),
-    ("smartfon", "smartphone"),
-    ("laptop", "notebook"),
-    ("klawiatura", "keyboard"),
-    ("mysz", "mouse"),
-    ("sluchawk", "headphones"),
-    ("sluchawk", "headset"),
-    ("zegarek", "watch"),
-    ("rower", "bike"),
-    ("telewizor", "tv"),
-    ("pilot", "remote"),
-    ("kamera", "camera"),
-    ("kawa", "coffee"),
-];
+pub struct SynonymDict {
+    /// bidirectional (side_a, side_b) stemmed token sequences
+    pairs: Vec<(Vec<String>, Vec<String>)>,
+}
 
-/// Multi-word synonym pairs (spec index-rs-phrase-synonyms W1): an
-/// adjacent token sequence (the phrase) ↔ alternative tokens. FOLDED+
-/// STEMMED form ("zdalnego"→"zdaln", "sterowania"→"sterowan",
-/// "graficzna"→"graficzn", "grafika"→"grafik", "kawy"→"kaw").
-const PL_SYNONYM_PHRASES: &[(&[&str], &[&str])] = &[
-    (&["kart", "graficzn"], &["gpu", "grafik"]),
-    (&["ekspres", "do", "kaw"], &["ekspres"]),
-    (&["pilot", "zdaln", "sterowan"], &["pilot"]),
-];
+impl SynonymDict {
+    pub fn empty() -> Self {
+        Self { pairs: Vec::new() }
+    }
+
+    /// Build from raw (unstemmed) rule pairs — each token folded+stemmed
+    /// individually (spec index-rs-dynamic-synonyms W2).
+    pub fn from_raw(pairs: impl IntoIterator<Item = (Vec<String>, Vec<String>)>) -> Self {
+        let stem_seq = |v: &[String]| -> Vec<String> {
+            v.iter().map(|w| stem_pl(&fold_str(w)).to_string()).collect()
+        };
+        Self {
+            pairs: pairs
+                .into_iter()
+                .map(|(a, b)| (stem_seq(&a), stem_seq(&b)))
+                .collect(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+}
 
 /// One member of a synonym group: a single term or an adjacent phrase
 /// (verified via tantivy PhraseQuery — adjacency strict, W3).
@@ -230,61 +241,65 @@ enum GroupMember {
     Phrase(Vec<String>),
 }
 
-fn synonyms_of(token: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (a, b) in PL_SYNONYMS {
-        if token == *a {
-            out.push((*b).to_string());
-        } else if token == *b {
-            out.push((*a).to_string());
+/// Group tokens with their dictionary synonyms: each group is one msm
+/// UNIT — a doc matching any group member counts once, and
+/// `minimum_should_match` keeps its per-original-token semantics
+/// (expansion must not inflate the required count). A matched
+/// multi-word phrase MERGES its token positions into ONE group
+/// (semantically one concept). Longest phrase match wins (greedy).
+fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Vec<GroupMember>> {
+    let push_alt = |g: &mut Vec<GroupMember>, alt: &[String]| {
+        if alt.len() == 1 {
+            g.push(GroupMember::Term(alt[0].clone()));
+        } else {
+            g.push(GroupMember::Phrase(alt.to_vec()));
         }
-    }
-    out
-}
-
-/// Group tokens with their synonyms: each group is one msm UNIT — a doc
-/// matching any group member counts once, and `minimum_should_match`
-/// keeps its per-original-token semantics (expansion must not inflate
-/// the required count). A matched multi-word phrase MERGES its token
-/// positions into ONE group (W2 — semantically one concept).
-fn expand_synonym_groups(tokens: Vec<String>) -> Vec<Vec<GroupMember>> {
+    };
     let mut groups: Vec<Vec<GroupMember>> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        // longest phrase match at the current position (greedy, W2)
+        // longest phrase side match at the current position (greedy)
         let mut matched: Option<(usize, usize)> = None;
-        for (pi, (phrase, _alts)) in PL_SYNONYM_PHRASES.iter().enumerate() {
-            let len = phrase.len();
-            if i + len <= tokens.len()
-                && matched.is_none_or(|(_, l)| len > l)
-                && phrase.iter().zip(&tokens[i..i + len]).all(|(p, t)| p == t)
-            {
-                matched = Some((pi, len));
+        for (pi, (a, b)) in dict.pairs.iter().enumerate() {
+            for (seq, _alt) in [(a.as_slice(), b.as_slice()), (b.as_slice(), a.as_slice())] {
+                let len = seq.len();
+                if len >= 2
+                    && i + len <= tokens.len()
+                    && matched.is_none_or(|(_, l)| len > l)
+                    && seq.iter().zip(&tokens[i..i + len]).all(|(s, t)| s == t)
+                {
+                    matched = Some((pi, len));
+                }
             }
         }
-        if let Some((pi, len)) = matched {
-            let (phrase, alts) = &PL_SYNONYM_PHRASES[pi];
-            let mut g = vec![GroupMember::Phrase(
-                phrase.iter().map(|s| s.to_string()).collect(),
-            )];
-            for a in alts.iter() {
-                g.push(GroupMember::Term((*a).to_string()));
-            }
+        if let Some((pi, _len)) = matched {
+            let (a, b) = &dict.pairs[pi];
+            // the matched side becomes the Phrase; the other side joins
+            // the group as the alternative (term or phrase)
+            let side_fits = |seq: &[String]| {
+                i + seq.len() <= tokens.len()
+                    && seq.iter().zip(&tokens[i..i + seq.len()]).all(|(s, t)| s == t)
+            };
+            let (seq, alt) = if side_fits(a) {
+                (a.as_slice(), b.as_slice())
+            } else {
+                (b.as_slice(), a.as_slice())
+            };
+            let mut g = vec![GroupMember::Phrase(seq.to_vec())];
+            push_alt(&mut g, alt);
             groups.push(g);
-            i += len;
+            i += seq.len();
             continue;
         }
-        // single token: original + single-token synonyms + reverse
-        // phrases (queries containing an alternative also match docs
-        // with the full phrase)
+        // single token: original + pairs where either side is exactly
+        // this token (the other side joins the group — term or phrase)
         let t = &tokens[i];
         let mut g = vec![GroupMember::Term(t.clone())];
-        g.extend(synonyms_of(t).into_iter().map(GroupMember::Term));
-        for (phrase, alts) in PL_SYNONYM_PHRASES {
-            if alts.iter().any(|a| a == t) {
-                g.push(GroupMember::Phrase(
-                    phrase.iter().map(|s| s.to_string()).collect(),
-                ));
+        for (a, b) in &dict.pairs {
+            for (seq, alt) in [(a.as_slice(), b.as_slice()), (b.as_slice(), a.as_slice())] {
+                if seq.len() == 1 && &seq[0] == t {
+                    push_alt(&mut g, alt);
+                }
             }
         }
         groups.push(g);
@@ -587,6 +602,9 @@ pub struct Engine {
     /// Embeddings upserted since the last full rebuild (the mmap matrix is
     /// immutable). Keyed by docno — rebuilt with a fresh Engine at swap.
     pending_vectors: std::sync::RwLock<HashMap<usize, Vec<f32>>>,
+    /// Dynamic synonym dictionary (spec index-rs-dynamic-synonyms W3) —
+    /// hot-swappable without a rebuild; expansion reads it per query.
+    synonyms: std::sync::RwLock<SynonymDict>,
     _tmp: Option<tempfile::TempDir>,
 }
 
@@ -771,6 +789,17 @@ impl Engine {
     /// Tantivy index is always built fresh in a temp dir (29k docs →
     /// seconds) — no load/persist dance, `slug` is the id everywhere.
     pub fn build(docs: Vec<EngineDoc>, data_dir: Option<PathBuf>) -> Result<Self, String> {
+        Self::build_with_synonyms(docs, data_dir, SynonymDict::empty())
+    }
+
+    /// Build with a dynamic synonym dictionary (spec
+    /// index-rs-dynamic-synonyms W2): boot/rebuild paths load it from the
+    /// synonym_rules table; tests inject it directly.
+    pub fn build_with_synonyms(
+        docs: Vec<EngineDoc>,
+        data_dir: Option<PathBuf>,
+        synonyms: SynonymDict,
+    ) -> Result<Self, String> {
         if let Some(d) = data_dir.as_ref() {
             sweep_stale_tempdirs(d);
         }
@@ -879,12 +908,50 @@ impl Engine {
             terms: std::sync::RwLock::new(terms),
             vectors,
             pending_vectors: std::sync::RwLock::new(HashMap::new()),
+            synonyms: std::sync::RwLock::new(synonyms),
             _tmp: Some(tmp),
         })
     }
 
     pub fn num_docs(&self) -> usize {
         self.recs().iter().filter(|r| !r.deleted).count()
+    }
+
+    /// Hot-swap the synonym dictionary (spec index-rs-dynamic-synonyms W4):
+    /// takes effect on the very next query — no reindex, no rebuild.
+    pub fn set_synonyms(&self, dict: SynonymDict) {
+        *self.synonyms.write().expect("synonyms lock poisoned") = dict;
+    }
+
+    /// Top dictionary terms of a text field by document frequency (spec
+    /// index-rs-llm-synonym-mining — candidate vocabulary for the LLM
+    /// miner). Count collector hits the term-doc_freq fast path, so a
+    /// full dictionary sweep is cheap and runs once per mining pass.
+    pub fn top_terms(&self, field_name: &str, limit: usize) -> Vec<(String, usize)> {
+        let Some(field) = self.fields.text.get(field_name).copied() else {
+            return Vec::new();
+        };
+        let searcher = self.searcher();
+        let terms = self.terms.read().expect("terms lock poisoned");
+        let Some(set) = terms.get(field_name) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, usize)> = Vec::with_capacity(set.len());
+        for t in set.iter() {
+            let count = searcher
+                .search(
+                    &TermQuery::new(
+                        Term::from_field_text(field, t),
+                        IndexRecordOption::Basic,
+                    ),
+                    &tantivy::collector::Count,
+                )
+                .unwrap_or(0);
+            out.push((t.clone(), count));
+        }
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out.truncate(limit);
+        out
     }
 
     fn recs(&self) -> std::sync::RwLockReadGuard<'_, Vec<DocRec>> {
@@ -1356,7 +1423,11 @@ impl Engine {
                 })
                 .collect()
         } else {
-            expand_synonym_groups(tokens)
+            let groups = {
+                let dict = self.synonyms.read().expect("synonyms lock poisoned");
+                expand_synonym_groups(&dict, tokens)
+            };
+            groups
                 .iter()
                 .map(|group| {
                     // union over the group members (terms + phrases)
@@ -1521,7 +1592,10 @@ impl Engine {
         // Spec index-rs-synonyms W2: synonym groups — the GROUP is the
         // msm unit, so minimum_should_match keeps its per-original-token
         // semantics (W3).
-        let groups = expand_synonym_groups(folded_tokens(text));
+        let groups = {
+            let dict = self.synonyms.read().expect("synonyms lock poisoned");
+            expand_synonym_groups(&dict, folded_tokens(text))
+        };
         let mut best: BTreeMap<usize, f64> = BTreeMap::new();
         for (name, fboost) in fields {
             // Per-field score: sum over matched groups (operator), with the

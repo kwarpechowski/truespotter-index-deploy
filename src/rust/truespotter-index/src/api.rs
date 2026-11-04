@@ -359,10 +359,19 @@ pub async fn rebuild_handler(State(state): State<Arc<AppState>>, headers: Header
         }
     };
     let n = docs.len();
+    // dynamic synonyms ride every rebuild (spec index-rs-dynamic-synonyms W5)
+    let synonyms = match crate::store::load_synonym_dict(&pool).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "synonym dictionary load failed — building without");
+            crate::engine::SynonymDict::empty()
+        }
+    };
     let data_dir = std::env::var("DATA_DIR").map(std::path::PathBuf::from).ok();
-    let engine =
-        match tokio::task::spawn_blocking(move || crate::engine::Engine::build(docs, data_dir))
-            .await
+    let engine = match tokio::task::spawn_blocking(move || {
+        crate::engine::Engine::build_with_synonyms(docs, data_dir, synonyms)
+    })
+    .await
         {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => {
@@ -467,6 +476,209 @@ pub fn write_response(index: &str, id: &str, result: &str) -> Value {
         "result": result,
         "_shards": shards()
     })
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic synonym dictionary (spec index-rs-dynamic-synonyms W4)
+// ---------------------------------------------------------------------------
+
+/// Apply the dictionary loaded from PG into the LIVE engine (hot swap —
+/// takes effect on the very next query, no reindex, no rebuild).
+async fn apply_synonyms_to_engine(state: &AppState) -> Result<usize, String> {
+    let pool = state.pool.clone().ok_or("no database configured")?;
+    let rules = crate::store::load_synonym_rules(&pool).await?;
+    let n = rules.len();
+    let dict = crate::engine::SynonymDict::from_raw(
+        rules.into_iter().map(|r| (r.terms_a, r.terms_b)),
+    );
+    let engine = state.engine.read().await.clone();
+    engine.set_synonyms(dict);
+    Ok(n)
+}
+
+/// Shared admin-secret gate (same semantics as /admin/rebuild): missing
+/// REBUILD_SECRET -> 404; wrong/absent header -> 403.
+fn require_admin_secret(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let expected = state.rebuild_secret.clone();
+    let given = headers
+        .get("x-rebuild-secret")
+        .and_then(|v| v.to_str().ok());
+    match (&expected, given) {
+        (Some(exp), Some(g)) if exp == g => None,
+        (None, _) => Some(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "REBUILD_SECRET is not configured" })),
+            )
+                .into_response(),
+        ),
+        _ => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "invalid x-rebuild-secret" })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// GET /{index}/_synonyms — list the dictionary from PG (read-only, no secret).
+pub async fn synonyms_list_handler(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<String>,
+) -> Response {
+    let Some(pool) = state.pool.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no database configured" })),
+        )
+            .into_response();
+    };
+    let rules = match crate::store::load_synonym_rules(&pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    Json(json!({
+        "index": index,
+        "count": rules.len(),
+        "rules": rules.into_iter().map(|r| json!({
+            "id": r.id,
+            "terms_a": r.terms_a,
+            "terms_b": r.terms_b,
+        })).collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+/// POST /{index}/_synonyms — add a rule (admin-secret) and hot-apply.
+pub async fn synonyms_insert_handler(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = require_admin_secret(&state, &headers) {
+        return resp;
+    }
+    let Some((terms_a, terms_b, category)) = parse_synonym_body(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "body must be {terms_a: [...], terms_b: [...], category?} with 1-4 non-empty tokens per side"
+            })),
+        )
+            .into_response();
+    };
+    let Some(pool) = state.pool.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no database configured" })),
+        )
+            .into_response();
+    };
+    let _wl = state.write_lock.lock().await;
+    let id = match crate::store::insert_synonym_rule(&pool, &terms_a, &terms_b, category.as_deref()).await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let applied = apply_synonyms_to_engine(&state).await.unwrap_or(0);
+    Json(json!({ "index": index, "id": id, "applied_rules": applied })).into_response()
+}
+
+/// DELETE /{index}/_synonyms/{id} — remove a rule (admin-secret) and hot-apply.
+pub async fn synonyms_delete_handler(
+    State(state): State<Arc<AppState>>,
+    Path((index, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = require_admin_secret(&state, &headers) {
+        return resp;
+    }
+    let Ok(id) = id.parse::<i64>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "id must be an integer" })),
+        )
+            .into_response();
+    };
+    let Some(pool) = state.pool.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no database configured" })),
+        )
+            .into_response();
+    };
+    let _wl = state.write_lock.lock().await;
+    let deleted = match crate::store::delete_synonym_rule(&pool, id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+                .into_response()
+        }
+    };
+    let applied = apply_synonyms_to_engine(&state).await.unwrap_or(0);
+    Json(json!({ "index": index, "deleted": deleted, "applied_rules": applied })).into_response()
+}
+
+/// POST /{index}/_synonyms/_reload — full reload from PG (admin-secret).
+pub async fn synonyms_reload_handler(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = require_admin_secret(&state, &headers) {
+        return resp;
+    }
+    match apply_synonyms_to_engine(&state).await {
+        Ok(applied) => Json(json!({ "index": index, "applied_rules": applied })).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// Validate the insert body: 1-4 non-empty tokens per side.
+fn parse_synonym_body(body: &serde_json::Value) -> Option<(Vec<String>, Vec<String>, Option<String>)> {
+    let side = |v: &serde_json::Value| -> Option<Vec<String>> {
+        let arr = v.as_array()?;
+        if arr.is_empty() || arr.len() > 4 {
+            return None;
+        }
+        arr.iter()
+            .map(|t| {
+                let s = t.as_str()?.trim().to_lowercase();
+                if s.is_empty() || s.len() > 40 {
+                    return None;
+                }
+                Some(s)
+            })
+            .collect()
+    };
+    let terms_a = side(body.get("terms_a")?)?;
+    let terms_b = side(body.get("terms_b")?)?;
+    let category = body
+        .get("category")
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    Some((terms_a, terms_b, category))
 }
 
 /// Ensure the doc carries its own slug (search-by-slug consistency).

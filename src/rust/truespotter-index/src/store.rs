@@ -47,7 +47,177 @@ pub async fn ensure_table(pool: &PgPool) -> Result<(), String> {
         .execute(pool)
         .await
         .map_err(|e| format!("ensure catalog_documents.version: {e}"))?;
+    // Dynamic synonym dictionary (spec index-rs-dynamic-synonyms W1) —
+    // the durable CACHE for LLM-generated and admin-curated pairs.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS synonym_rules (
+            id bigserial PRIMARY KEY,
+            terms_a text[] NOT NULL,
+            terms_b text[] NOT NULL,
+            category text,
+            enabled boolean NOT NULL DEFAULT true,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("ensure synonym_rules: {e}"))?;
+    // LLM mining dedup: terms already attempted (generated or not).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS synonym_gen_log (
+            term text PRIMARY KEY,
+            last_run timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("ensure synonym_gen_log: {e}"))?;
+    // Seed only when the dictionary is empty (W6) — curated pairs
+    // covering the real prod categories (books/footwear/pet food/apparel).
+    sqlx::query(SCHEMA_SEED_SYNONYMS)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("seed synonym_rules: {e}"))?;
     Ok(())
+}
+
+const SCHEMA_SEED_SYNONYMS: &str = r#"
+INSERT INTO synonym_rules (terms_a, terms_b)
+SELECT v.a, v.b
+FROM (VALUES
+    (ARRAY['buty'],            ARRAY['obuwie']),
+    (ARRAY['smartfon'],        ARRAY['telefon']),
+    (ARRAY['smartfon'],        ARRAY['smartphone']),
+    (ARRAY['laptop'],          ARRAY['notebook']),
+    (ARRAY['klawiatura'],      ARRAY['keyboard']),
+    (ARRAY['mysz'],            ARRAY['mouse']),
+    (ARRAY['słuchawki'],       ARRAY['headphones']),
+    (ARRAY['słuchawki'],       ARRAY['headset']),
+    (ARRAY['zegarek'],         ARRAY['watch']),
+    (ARRAY['rower'],           ARRAY['bike']),
+    (ARRAY['telewizor'],       ARRAY['tv']),
+    (ARRAY['pilot'],           ARRAY['remote']),
+    (ARRAY['kamera'],          ARRAY['camera']),
+    (ARRAY['kawa'],            ARRAY['coffee']),
+    (ARRAY['rękawiczki'],      ARRAY['rękawice']),
+    (ARRAY['spodenki'],        ARRAY['szorty']),
+    (ARRAY['bluza'],           ARRAY['hoodie']),
+    (ARRAY['koszulki'],        ARRAY['t-shirty']),
+    (ARRAY['torba'],           ARRAY['torebka']),
+    (ARRAY['klapki'],          ARRAY['sandały']),
+    (ARRAY['karta','graficzna'], ARRAY['gpu']),
+    (ARRAY['karta','graficzna'], ARRAY['grafika']),
+    (ARRAY['ekspres','do','kawy'], ARRAY['ekspres']),
+    (ARRAY['pilot','zdalnego','sterowania'], ARRAY['pilot']),
+    (ARRAY['buty','sportowe'], ARRAY['sneakersy']),
+    (ARRAY['buty','do','biegania'], ARRAY['buty','biegowe']),
+    (ARRAY['karma','dla','psów'], ARRAY['karma','psia']),
+    (ARRAY['przysmaki','dla','psów'], ARRAY['smakołyki']),
+    (ARRAY['przysmaki','dla','kotów'], ARRAY['smakołyki']),
+    (ARRAY['bielizna','termoaktywna'], ARRAY['termobielizna'])
+) AS v(a, b)
+WHERE NOT EXISTS (SELECT 1 FROM synonym_rules)
+"#;
+
+/// One enabled synonym rule — raw words, both sides token sequences.
+pub struct SynonymRule {
+    pub id: i64,
+    pub terms_a: Vec<String>,
+    pub terms_b: Vec<String>,
+}
+
+/// All enabled rules (spec index-rs-dynamic-synonyms W2 loading).
+pub async fn load_synonym_rules(pool: &PgPool) -> Result<Vec<SynonymRule>, String> {
+    let rows = sqlx::query_as::<_, (i64, Vec<String>, Vec<String>)>(
+        "SELECT id, terms_a, terms_b FROM synonym_rules WHERE enabled ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("load synonym_rules: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, terms_a, terms_b)| SynonymRule {
+            id,
+            terms_a,
+            terms_b,
+        })
+        .collect())
+}
+
+/// Insert a rule and return its id.
+pub async fn insert_synonym_rule(
+    pool: &PgPool,
+    terms_a: &[String],
+    terms_b: &[String],
+    category: Option<&str>,
+) -> Result<i64, String> {
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO synonym_rules (terms_a, terms_b, category) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(terms_a)
+    .bind(terms_b)
+    .bind(category)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("insert synonym_rules: {e}"))?;
+    Ok(id)
+}
+
+/// Delete a rule; returns whether it existed.
+pub async fn delete_synonym_rule(pool: &PgPool, id: i64) -> Result<bool, String> {
+    let n = sqlx::query("DELETE FROM synonym_rules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("delete synonym_rules: {e}"))?;
+    Ok(n.rows_affected() > 0)
+}
+
+/// Mining dedup (spec index-rs-llm-synonym-mining): terms already covered
+/// by any rule side (either side of any pair) — skip mining them again.
+pub async fn covered_synonym_terms(pool: &PgPool) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT unnest(terms_a) FROM synonym_rules UNION SELECT DISTINCT unnest(terms_b) FROM synonym_rules",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("covered synonym terms: {e}"))?;
+    Ok(rows.into_iter().map(|(t,)| t).collect())
+}
+
+/// Mark a term as mined (attempted), regardless of LLM result.
+pub async fn log_synonym_gen(pool: &PgPool, term: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO synonym_gen_log (term) VALUES ($1) ON CONFLICT (term) DO UPDATE SET last_run = now()",
+    )
+    .bind(term)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("log synonym gen: {e}"))?;
+    Ok(())
+}
+
+/// Load the synonym dictionary for an engine build (spec
+/// index-rs-dynamic-synonyms W5) — errors degrade to an empty dict
+/// (the engine must still build).
+pub async fn load_synonym_dict(pool: &PgPool) -> Result<crate::engine::SynonymDict, String> {
+    let rules = load_synonym_rules(pool).await?;
+    Ok(crate::engine::SynonymDict::from_raw(
+        rules.into_iter().map(|r| (r.terms_a, r.terms_b)),
+    ))
+}
+
+/// Terms already attempted by the miner.
+pub async fn mined_synonym_terms(pool: &PgPool) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT term FROM synonym_gen_log")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("mined synonym terms: {e}"))?;
+    Ok(rows.into_iter().map(|(t,)| t).collect())
 }
 
 pub async fn connect(url: &str) -> Result<PgPool, String> {
