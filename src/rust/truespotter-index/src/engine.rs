@@ -12,11 +12,13 @@
 //! missing/_last), search_after cursor, terms/filter/stats aggregations.
 //! Ranking is deterministic: the implicit final tie-break is `slug` asc.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rayon::prelude::*;
 use serde_json::{json, Map, Value};
 use tantivy::collector::TopDocs;
 use tantivy::query::{PhraseQuery, TermQuery};
@@ -62,7 +64,8 @@ struct DocRec {
     created_at: Option<i64>,
     /// the `id` doc field (external ref, e.g. "gid://shopify/…")
     external_id: Option<String>,
-    embedding: Option<Vec<f32>>,
+    /// (embeddings live in the VectorStore mmap + the small `pending_vectors`
+    /// sidecar — NOT per-record; 32k x 16KB duplicates cost ~512MB RSS)
     /// tombstone flag — deleted slots keep the docno mapping stable until
     /// the next full rebuild compacts the corpus.
     deleted: bool,
@@ -198,6 +201,26 @@ impl TokenStream for TsTokenStream {
 // (spec-approved LanceDB fallback).
 // ---------------------------------------------------------------------------
 
+/// Persisted-matrix header magic ("TSIN" LE) — W2 (spec
+/// index-rs-optimization): guards the normalized-vector format. Files
+/// written by pre-W2 builds start with the dim u32 instead and are
+/// ignored (the build always rewrites the file fresh from PG rows).
+const VECTORS_MAGIC: u32 = 0x5453_494E;
+const VECTORS_VERSION: u32 = 2;
+
+/// L2-normalize a vector (W2): stored embeddings are unit-length so the
+/// kNN scan is a plain dot product (one pass instead of three). A
+/// zero-norm vector passes through unchanged (dot = 0 → neutral score
+/// 0.5, same as the old cos=0 branch).
+pub(crate) fn l2_normalize(v: &[f32]) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 && (norm - 1.0).abs() > 1e-6 {
+        v.iter().map(|x| x / norm).collect()
+    } else {
+        v.to_vec()
+    }
+}
+
 enum VectorStore {
     Empty,
     Ram {
@@ -215,29 +238,35 @@ enum VectorStore {
 }
 
 impl VectorStore {
-    /// Build from the records; persist+mmmap into `dir` when possible.
-    fn build(records: &[DocRec], dir: Option<&std::path::Path>) -> Self {
-        let dim = records
+    /// Build from the per-doc embeddings (parallel to records); persist +
+    /// mmap into `dir` when possible.
+    fn build(embeddings: &[Option<Vec<f32>>], dir: Option<&std::path::Path>) -> Self {
+        let dim = embeddings
             .iter()
-            .find_map(|r| r.embedding.as_ref().map(|e| e.len()))
+            .find_map(|e| e.as_ref().map(|v| v.len()))
             .unwrap_or(0);
         if dim == 0 {
             return VectorStore::Empty;
         }
-        let n = records.len();
-        let has_vec: Vec<bool> = records
+        let n = embeddings.len();
+        let has_vec: Vec<bool> = embeddings
             .iter()
-            .map(|r| r.embedding.as_ref().is_some_and(|e| e.len() == dim))
+            .map(|e| e.as_ref().is_some_and(|v| v.len() == dim))
             .collect();
         let mut data = vec![0f32; n * dim];
-        for (i, r) in records.iter().enumerate() {
-            if let Some(e) = r.embedding.as_ref().filter(|e| e.len() == dim) {
-                data[i * dim..(i + 1) * dim].copy_from_slice(e);
+        for (i, e) in embeddings.iter().enumerate() {
+            if let Some(e) = e.as_ref().filter(|e| e.len() == dim) {
+                // W2: rows are stored L2-normalized — the kNN scan is a
+                // plain dot product.
+                let normed = l2_normalize(e);
+                data[i * dim..(i + 1) * dim].copy_from_slice(&normed);
             }
         }
         if let Some(dir) = dir {
             let path = dir.join("vectors.f32");
-            let mut buf: Vec<u8> = Vec::with_capacity(8 + data.len() * 4);
+            let mut buf: Vec<u8> = Vec::with_capacity(16 + data.len() * 4);
+            buf.extend_from_slice(&VECTORS_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&VECTORS_VERSION.to_le_bytes());
             buf.extend_from_slice(&(dim as u32).to_le_bytes());
             buf.extend_from_slice(&(n as u32).to_le_bytes());
             for f in &data {
@@ -245,10 +274,16 @@ impl VectorStore {
             }
             if fs::create_dir_all(dir).is_ok() && fs::write(&path, &buf).is_ok() {
                 if let Ok(bytes) = fs::read(&path) {
-                    if bytes.len() >= 8 {
-                        let fdim = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-                        let fnn = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-                        if fdim == dim && fnn == n {
+                    if bytes.len() >= 16 {
+                        let fmagic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                        let fversion = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                        let fdim = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+                        let fnn = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+                        if fmagic == VECTORS_MAGIC
+                            && fversion == VECTORS_VERSION
+                            && fdim == dim
+                            && fnn == n
+                        {
                             if let Ok(map) = unsafe { memmap2::Mmap::map(&path_as_file(&path)) } {
                                 return VectorStore::Mmap {
                                     map,
@@ -271,16 +306,43 @@ impl VectorStore {
         }
     }
 
+    fn has_at(&self, i: usize) -> bool {
+        match self {
+            VectorStore::Empty => false,
+            VectorStore::Ram { n, has_vec, .. } | VectorStore::Mmap { n, has_vec, .. } => {
+                i < *n && has_vec[i]
+            }
+        }
+    }
+
+    /// Owned copy for the write path (partial-update "keep embedding").
+    fn row_vec(&self, i: usize) -> Option<Vec<f32>> {
+        self.row(i).map(|r| r.to_vec())
+    }
+
     fn row(&self, i: usize) -> Option<&[f32]> {
+        // i can exceed the build-time matrix (docs upserted after build —
+        // their vectors live in pending_vectors, not the matrix)
+        if i >= self.len() {
+            return None;
+        }
         match self {
             VectorStore::Empty => None,
             VectorStore::Ram { data, dim, .. } => Some(&data[i * dim..(i + 1) * dim]),
             VectorStore::Mmap { map, dim, .. } => {
-                let off = (i * dim) * 4 + 8;
+                // 16-byte header: magic + version + dim + n (W2)
+                let off = (i * dim) * 4 + 16;
                 let bytes = &map[off..off + dim * 4];
                 // Safety-free view: copy is avoided by transmute-free re-reading below.
                 Some(vector_slice(bytes, *dim))
             }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            VectorStore::Empty => 0,
+            VectorStore::Ram { n, .. } | VectorStore::Mmap { n, .. } => *n,
         }
     }
 }
@@ -315,6 +377,9 @@ pub struct Engine {
     /// extended on every write so new tokens are findable without a rebuild
     terms: std::sync::RwLock<HashMap<&'static str, BTreeSet<String>>>,
     vectors: VectorStore,
+    /// Embeddings upserted since the last full rebuild (the mmap matrix is
+    /// immutable). Keyed by docno — rebuilt with a fresh Engine at swap.
+    pending_vectors: std::sync::RwLock<HashMap<usize, Vec<f32>>>,
     _tmp: Option<tempfile::TempDir>,
 }
 
@@ -408,8 +473,46 @@ fn extract_rec(slug: &str, doc: &Value) -> DocRec {
         trust_count: get_f64(doc, "trust_count"),
         created_at: doc.get("created_at").and_then(parse_created_at),
         external_id: doc.get("id").and_then(|i| i.as_str()).map(String::from),
-        embedding: None,
         deleted: false,
+    }
+}
+
+/// Boot-time sweep: remove leaked tantivy temp dirs left by previous
+/// crashed/killed builds. SIGKILL never runs `Drop` (TempDir), so every hard
+/// restart leaked a full index on /data (72 leaks found on prod). Dirs
+/// younger than 10 minutes are left alone (a concurrent build in the same
+/// container may own them); failures only warn — never fail the boot.
+pub(crate) fn sweep_stale_tempdirs(dir: &std::path::Path) {
+    sweep_stale_tempdirs_with(dir, std::time::Duration::from_secs(600));
+}
+
+pub(crate) fn sweep_stale_tempdirs_with(dir: &std::path::Path, max_age: std::time::Duration) {
+    let cutoff = std::time::SystemTime::now() - max_age;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(n) => n,
+            None => continue,
+        };
+        if !name.starts_with(".tmp") {
+            continue;
+        }
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|mt| mt < cutoff)
+            .unwrap_or(false);
+        if !is_stale {
+            continue;
+        }
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(dir = name, "swept leaked tantivy temp dir"),
+            Err(e) => tracing::warn!(dir = name, error = %e, "temp dir sweep failed"),
+        }
     }
 }
 
@@ -419,6 +522,9 @@ impl Engine {
     /// Tantivy index is always built fresh in a temp dir (29k docs →
     /// seconds) — no load/persist dance, `slug` is the id everywhere.
     pub fn build(docs: Vec<EngineDoc>, data_dir: Option<PathBuf>) -> Result<Self, String> {
+        if let Some(d) = data_dir.as_ref() {
+            sweep_stale_tempdirs(d);
+        }
         // scratch containers have no /tmp — tempfile::tempdir needs an env
         // TMPDIR that exists. Prefer the data dir, else create one under the
         // first writable base (./, /data, / — scratch has no writable /
@@ -467,9 +573,12 @@ impl Engine {
         for name in TEXT_FIELDS {
             terms.insert(name, BTreeSet::new());
         }
+        // embeddings travel parallel to records (extract_rec no longer
+        // stores them — the mmap matrix is their only long-term home)
+        let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
         for (i, d) in docs.into_iter().enumerate() {
-            let mut rec = extract_rec(&d.slug, &d.doc);
-            rec.embedding = d.embedding.clone();
+            let rec = extract_rec(&d.slug, &d.doc);
+            embeddings.push(d.embedding);
             let mut tdoc = TantivyDocument::default();
             for name in TEXT_FIELDS {
                 let texts = match name {
@@ -507,7 +616,7 @@ impl Engine {
             .try_into()
             .map_err(|e| format!("tantivy reader: {e}"))?;
         let _ = reader.reload();
-        let vectors = VectorStore::build(&records, data_dir.as_deref());
+        let vectors = VectorStore::build(&embeddings, data_dir.as_deref());
         let fields = Fields {
             text,
             slug: slug_field,
@@ -520,6 +629,7 @@ impl Engine {
             fields,
             terms: std::sync::RwLock::new(terms),
             vectors,
+            pending_vectors: std::sync::RwLock::new(HashMap::new()),
             _tmp: Some(tmp),
         })
     }
@@ -570,21 +680,40 @@ impl Engine {
 
     /// Fast known string fields, falling back to the raw JSON for ad-hoc
     /// fields (exists/term/prefix on category, model_key, external_ids…).
-    fn str_field_dyn(rec: &DocRec, field: &str) -> Option<String> {
-        match field.trim_end_matches(".keyword") {
-            "slug" => Some(rec.slug.clone()),
-            "title" => Some(rec.title.clone()),
-            "vendor" | "brand" | "type" | "category" | "category_path" | "currency" | "status"
-            | "author" | "genre" | "id" => Self::str_field(rec, field).map(String::from),
-            _ => raw_value(rec, field).and_then(|v| v.as_str().map(String::from)),
+    /// W4 (spec index-rs-optimization): returns a borrow instead of an
+    /// owned String — the filter clauses scan the whole corpus per query
+    /// and the old per-record clone was tens of thousands of allocations.
+    fn str_field_cow<'a>(rec: &'a DocRec, field: &str) -> Option<Cow<'a, str>> {
+        let f = field.trim_end_matches(".keyword");
+        match f {
+            "slug" => Some(Cow::Borrowed(&rec.slug)),
+            "title" => Some(Cow::Borrowed(&rec.title)),
+            "vendor" => rec.vendor.as_deref().map(Cow::Borrowed),
+            "brand" => rec.brand.as_deref().map(Cow::Borrowed),
+            "type" => rec.category.as_deref().map(Cow::Borrowed),
+            "category" => rec.category2.as_deref().map(Cow::Borrowed),
+            "category_path" => rec.category_path.as_deref().map(Cow::Borrowed),
+            "currency" => rec.currency.as_deref().map(Cow::Borrowed),
+            "status" => rec.status.as_deref().map(Cow::Borrowed),
+            "author" => rec.author.as_deref().map(Cow::Borrowed),
+            "genre" => rec.genre.as_deref().map(Cow::Borrowed),
+            "id" => rec.external_id.as_deref().map(Cow::Borrowed),
+            _ => raw_value(rec, f).and_then(|v| v.as_str().map(|s| Cow::Owned(String::from(s)))),
         }
     }
 
-    fn exists_field(rec: &DocRec, field: &str) -> bool {
+    fn exists_field(&self, rec: &DocRec, docno: usize, field: &str) -> bool {
         match field {
             "tags" => !rec.tags.is_empty(),
-            "embedding" => rec.embedding.is_some(),
-            _ => match Self::str_field_dyn(rec, field) {
+            "embedding" => {
+                self.vectors.has_at(docno)
+                    || self
+                        .pending_vectors
+                        .read()
+                        .expect("pending lock poisoned")
+                        .contains_key(&docno)
+            }
+            _ => match Self::str_field_cow(rec, field) {
                 Some(s) => !s.is_empty(),
                 None => raw_value(rec, field)
                     .map(|v| !v.is_null())
@@ -625,7 +754,7 @@ impl Engine {
                     .enumerate()
                     .filter(|(_, r)| !r.deleted)
                     .filter(|(_, r)| {
-                        Self::str_field_dyn(r, field).is_some_and(|s| s.starts_with(value.as_str()))
+                        Self::str_field_cow(r, field).is_some_and(|s| s.starts_with(value.as_str()))
                     })
                     .map(|(i, _)| (i, 1.0))
                     .collect()
@@ -650,7 +779,7 @@ impl Engine {
                 Ok(records
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| !r.deleted && Self::exists_field(r, field))
+                    .filter(|(i, r)| !r.deleted && self.exists_field(r, *i, field))
                     .map(|(i, _)| (i, 1.0))
                     .collect())
             }
@@ -738,7 +867,7 @@ impl Engine {
                         r.tags.iter().any(|t| t == s)
                     } else {
                         Self::str_field(r, field).is_some_and(|f| f == s)
-                            || Self::str_field_dyn(r, field).as_deref() == Some(s)
+                            || Self::str_field_cow(r, field).as_deref() == Some(s.as_str())
                     }
                 }
                 TermValue::Bool(b) => {
@@ -943,10 +1072,13 @@ impl Engine {
                         m.insert(doc, s);
                     }
                 } else {
-                    let dict = {
-                        let terms = self.terms.read().expect("terms lock");
-                        terms[self.field_name(field)].clone()
-                    };
+                    // W1 (spec index-rs-optimization): borrow the dictionary
+                    // under the read guard instead of cloning the whole
+                    // BTreeSet — the old clone allocated tens of thousands
+                    // of Strings on EVERY fuzzy query. read-read RwLock
+                    // doesn't block; term_scores takes no terms lock.
+                    let terms = self.terms.read().expect("terms lock");
+                    let dict = &terms[self.field_name(field)];
                     for cand in dict.iter() {
                         if !prefix.is_empty() && !cand.starts_with(&prefix) {
                             continue;
@@ -1014,22 +1146,47 @@ impl Engine {
         let mut candidates: Vec<Vec<String>> = vec![tokens[..tokens.len() - 1].to_vec()];
         let last = tokens.last().expect("non-empty");
         if prefix {
-            let dict = {
+            // W1: borrow the dictionary under the read guard instead of
+            // cloning the whole BTreeSet per autocomplete query.
+            // W5 (spec index-rs-optimization): rank the prefix tail by
+            // document frequency (Count collector — cheap term-metadata
+            // path) instead of taking the first 50 alphabetically:
+            // frequent terms are the better autocomplete suggestions.
+            // Frequency ties keep the old alphabetical order so ranking
+            // stays deterministic.
+            let mut cands: Vec<String> = {
                 let terms = self.terms.read().expect("terms lock");
-                terms[self.field_name(tfield)].clone()
+                terms[self.field_name(tfield)]
+                    .iter()
+                    .filter(|t| t.starts_with(last.as_str()))
+                    .take(1000)
+                    .cloned()
+                    .collect()
             };
-            let mut tail: Vec<String> = dict
-                .iter()
-                .filter(|t| t.starts_with(last.as_str()))
-                .take(50)
-                .cloned()
-                .collect();
-            if tail.is_empty() {
+            if cands.is_empty() {
                 return BTreeMap::new();
             }
-            candidates = tail
+            let searcher = self.searcher();
+            let mut tail: Vec<(String, usize)> = cands
                 .drain(..)
                 .map(|t| {
+                    let count = searcher
+                        .search(
+                            &TermQuery::new(
+                                Term::from_field_text(tfield, &t),
+                                IndexRecordOption::Basic,
+                            ),
+                            &tantivy::collector::Count,
+                        )
+                        .unwrap_or(0);
+                    (t, count)
+                })
+                .collect();
+            tail.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            tail.truncate(50);
+            candidates = tail
+                .into_iter()
+                .map(|(t, _)| {
                     let mut v = tokens[..tokens.len() - 1].to_vec();
                     v.push(t);
                     v
@@ -1147,27 +1304,56 @@ impl Engine {
                 vector.len()
             ));
         }
-        // cosine similarity, OpenSearch lucene-engine score = (1+cos)/2.
-        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(n);
-        for (i, has) in has_vec.iter().enumerate() {
-            if !has {
+        // W2 (spec index-rs-optimization): stored rows are L2-normalized at
+        // write time, so cosine collapses to a plain dot product — ONE pass
+        // per row instead of three (dot + two norms). The query vector is
+        // normalized here (client embeddings are usually unit-length, but
+        // don't rely on it — scale must not change ranking).
+        let q = l2_normalize(vector);
+        // pending upserts override their (stale) matrix row until the next
+        // full rebuild swaps in a fresh Engine
+        let pending = self
+            .pending_vectors
+            .read()
+            .expect("pending lock poisoned")
+            .clone();
+        // W3: parallel score scan (rayon) over the matrix rows. Rows
+        // without a vector and rows overridden by pending upserts score
+        // -inf and are filtered below — the pending loop re-scores those
+        // (and rows beyond the matrix, which are pending-only).
+        let scores: Vec<f32> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if !has_vec[i] || pending.contains_key(&i) {
+                    return f32::NEG_INFINITY;
+                }
+                let row = self.vectors.row(i).expect("row present");
+                let mut dot = 0f32;
+                for j in 0..dim {
+                    dot += q[j] * row[j];
+                }
+                dot
+            })
+            .collect();
+        let mut scored: Vec<(usize, f32)> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(_, s)| *s > f32::NEG_INFINITY)
+            .map(|(docno, dot)| (docno, (1.0 + dot) / 2.0))
+            .collect();
+        // Score (1+cos)/2 semantics preserved for pending rows too; the
+        // defensive re-normalization covers rows upserted by pre-W2 engine
+        // instances that may still be unnormalized.
+        for (&docno, v) in pending.iter() {
+            if v.len() != dim {
                 continue;
             }
-            let row = self.vectors.row(i).expect("row present");
+            let row = l2_normalize(v);
             let mut dot = 0f32;
-            let mut na = 0f32;
-            let mut nb = 0f32;
             for j in 0..dim {
-                dot += vector[j] * row[j];
-                na += vector[j] * vector[j];
-                nb += row[j] * row[j];
+                dot += q[j] * row[j];
             }
-            let cos = if na == 0.0 || nb == 0.0 {
-                0.0
-            } else {
-                dot / (na.sqrt() * nb.sqrt())
-            };
-            scored.push((i, (1.0 + cos) / 2.0));
+            scored.push((docno, (1.0 + dot) / 2.0));
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         Ok(scored
@@ -1507,15 +1693,19 @@ impl Engine {
 
     /// Full doc fetch for the write path: (source JSON, stored embedding).
     pub fn get_doc(&self, id: &str) -> Option<(Value, Option<Vec<f32>>)> {
-        self.recs()
+        let records = self.recs();
+        let (i, r) = records
             .iter()
-            .find(|r| !r.deleted && r.slug == id)
-            .map(|r| {
-                (
-                    serde_json::from_str(&r.raw).unwrap_or(Value::Null),
-                    r.embedding.clone(),
-                )
-            })
+            .enumerate()
+            .find(|(_, r)| !r.deleted && r.slug == id)?;
+        let emb = self
+            .pending_vectors
+            .read()
+            .expect("pending lock poisoned")
+            .get(&i)
+            .cloned()
+            .or_else(|| self.vectors.row_vec(i));
+        Some((serde_json::from_str(&r.raw).unwrap_or(Value::Null), emb))
     }
 
     /// Slugs matching a query (the _update_by_query/_delete_by_query
@@ -1616,11 +1806,21 @@ impl Engine {
         let mut records = self.records.write().expect("records lock");
         let slot = records.iter().position(|r| !r.deleted && r.slug == slug);
         let existed = slot.is_some();
-        let mut rec = extract_rec(slug, &doc);
-        rec.embedding = match slot {
-            Some(i) => embedding.or_else(|| records[i].embedding.clone()),
-            None => embedding,
-        };
+        let rec = extract_rec(slug, &doc);
+        {
+            // New embeddings land in the pending sidecar (the mmap matrix is
+            // immutable until the next full rebuild); `embedding == None`
+            // keeps the stored one — get_doc falls back to the matrix row.
+            let docno = slot.unwrap_or(records.len());
+            if let Some(e) = embedding {
+                // W2: pending rows normalized at insert so the kNN scan is
+                // a plain dot product for them too.
+                self.pending_vectors
+                    .write()
+                    .expect("pending lock poisoned")
+                    .insert(docno, l2_normalize(&e));
+            }
+        }
         match slot {
             Some(i) => records[i] = rec,
             None => records.push(rec),
@@ -1661,7 +1861,6 @@ impl Engine {
             trust_count: None,
             created_at: None,
             external_id: None,
-            embedding: None,
             deleted: true,
         };
         true

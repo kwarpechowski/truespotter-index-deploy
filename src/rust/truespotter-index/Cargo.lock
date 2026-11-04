@@ -2775,6 +2775,7 @@ dependencies = [
  "axum",
  "chrono",
  "memmap2",
+ "rayon",
  "regex",
  "reqwest",
  "serde",

@@ -98,12 +98,14 @@ pub fn compute_update(
                 .and_then(|s| s.as_str())
                 .ok_or_else(|| UpdateError::Parse("script.source must be a string".into()))?;
             let params = script.get("params").cloned().unwrap_or(json!({}));
-            apply_script(source, &params, &mut doc).map_err(UpdateError::Script)?;
+            let modified = apply_script(source, &params, &mut doc).map_err(UpdateError::Script)?;
             let embedding = extract_embedding(&mut doc);
             return Ok(UpdateOutcome {
                 doc,
                 embedding,
-                result: "updated",
+                // "noop" mirrors OpenSearch: a script that sets ctx.op='noop'
+                // (e.g. the conditional chat promotion) leaves the doc as-is.
+                result: if modified { "updated" } else { "noop" },
             });
         }
     }
@@ -191,6 +193,9 @@ pub enum Pattern {
     SetModelKey,
     /// ReviewUpdateScript.ApplyModelTrustSource
     ApplyModelTrust,
+    /// TrueSpotter.Worker ChatDiscoveredPromotionHostedService — conditional
+    /// status promotion (pending → approved; anything else is a noop).
+    ChatPromotion,
 }
 
 /// The shared RecomputeAspectStats body (embedded inside several scripts —
@@ -236,6 +241,12 @@ pub const SCRIPT_SET_CATEGORY_AND_PATH: &str =
 pub const SCRIPT_SET_MODEL_KEY: &str = "ctx._source.model_key = params.modelKey; ";
 pub const SCRIPT_APPLY_MODEL_TRUST: &str = "ctx._source.trust_score = params.trustScore; ctx._source.trust_count = params.trustCount; ctx._source.source_count = params.sourceCount; ctx._source.trust_sources = params.trustSources; ctx._source.trust_score_computed_at = params.nowMs; ";
 
+/// TrueSpotter.Worker ChatDiscoveredPromotionHostedService (literal) —
+/// promotes a doc only while it is still `pending`; any other status at
+/// update time (admin curated in the meantime) is a semantic no-op
+/// (`ctx.op = 'noop'`), never an overwrite of the admin's decision.
+pub const SCRIPT_CHAT_PROMOTION: &str = "if (ctx._source.status == 'pending') { ctx._source.status = params.newStatus } else { ctx.op = 'noop' }";
+
 fn catalog_entry(pattern: Pattern, source: &str) -> (Pattern, String) {
     (pattern, normalize_ws(source))
 }
@@ -272,6 +283,7 @@ pub fn catalog() -> Vec<(Pattern, String)> {
         catalog_entry(Pattern::SetCategoryAndPath, SCRIPT_SET_CATEGORY_AND_PATH),
         catalog_entry(Pattern::SetModelKey, SCRIPT_SET_MODEL_KEY),
         catalog_entry(Pattern::ApplyModelTrust, SCRIPT_APPLY_MODEL_TRUST),
+        catalog_entry(Pattern::ChatPromotion, SCRIPT_CHAT_PROMOTION),
     ]
 }
 
@@ -288,13 +300,14 @@ pub fn match_pattern(normalized: &str) -> Result<Pattern, String> {
     ))
 }
 
-/// Apply a script from the catalog to a doc. `Ok(())` even when the script
-/// is a semantic no-op (idempotent review append).
+/// Apply a script from the catalog to a doc. Returns `Ok(true)` when the doc
+/// was modified, `Ok(false)` for a semantic no-op (the doc is unchanged),
+/// `Err` for an unrecognized/invalid script.
 pub fn apply_script(
     source: &str,
     params: &Value,
     doc: &mut Map<String, Value>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let normalized = normalize_ws(source);
     let pattern = match_pattern(&normalized)?;
     run(pattern, params, doc)
@@ -324,7 +337,7 @@ fn num(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_i64().map(|i| i as f64))
 }
 
-fn run(pattern: Pattern, params: &Value, doc: &mut Map<String, Value>) -> Result<(), String> {
+fn run(pattern: Pattern, params: &Value, doc: &mut Map<String, Value>) -> Result<bool, String> {
     match pattern {
         Pattern::SetType => {
             doc.insert("type".into(), params["category"].clone());
@@ -359,7 +372,19 @@ fn run(pattern: Pattern, params: &Value, doc: &mut Map<String, Value>) -> Result
         Pattern::AddComment => {
             arr_mut(doc, "comments").push(params["comment"].clone());
         }
-        Pattern::AppendOffer => append_offer(params, doc),
+        Pattern::AppendOffer => {
+            append_offer(params, doc);
+        }
+        Pattern::ChatPromotion => {
+            // Conditional promotion: only a still-pending doc is promoted;
+            // anything else is a semantic noop (result "noop").
+            if doc.get("status").and_then(|s| s.as_str()) == Some("pending") {
+                doc.insert("status".into(), params["newStatus"].clone());
+                return Ok(true);
+            } else {
+                return Ok(false);
+            }
+        }
         Pattern::ReviewSource => {
             // Idempotency backstop: same video_url → no-op.
             let review = params["review"].clone();
@@ -372,7 +397,7 @@ fn run(pattern: Pattern, params: &Value, doc: &mut Map<String, Value>) -> Result
                         .any(|r| get_str(r, "video_url") == get_str(&review, "video_url"))
                 });
             if already {
-                return Ok(());
+                return Ok(true);
             }
             arr_mut(doc, "youtube_reviews").push(review);
             let summary = params["summary"].as_str().unwrap_or_default();
@@ -449,7 +474,7 @@ fn run(pattern: Pattern, params: &Value, doc: &mut Map<String, Value>) -> Result
             recompute_aspect_stats(doc);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// OpenSearchBulkIndexer.AppendOfferScript — offer dedup by shop_slug with
@@ -950,7 +975,7 @@ mod tests {
     // ---- pattern catalog ----------------------------------------------------
 
     #[test]
-    fn all_13_wire_scripts_recognized_including_whitespace_drift() {
+    fn all_14_wire_scripts_recognized_including_whitespace_drift() {
         let scripts: Vec<String> = vec![
             SCRIPT_SET_TYPE.into(),
             SCRIPT_INC_CATEGORY_ATTEMPTS.into(),
@@ -965,8 +990,9 @@ mod tests {
             SCRIPT_SET_CATEGORY_AND_PATH.into(),
             SCRIPT_SET_MODEL_KEY.into(),
             SCRIPT_APPLY_MODEL_TRUST.into(),
+            SCRIPT_CHAT_PROMOTION.into(),
         ];
-        assert_eq!(scripts.len(), 13);
+        assert_eq!(scripts.len(), 14);
         for s in &scripts {
             // whitespace drift (newlines, double spaces) must still match —
             // the .NET single-line concatenations are the wire form
@@ -980,6 +1006,51 @@ mod tests {
         // unknown script -> loud failure
         assert!(match_pattern("ctx._source.hack = 1").is_err());
         assert!(apply_script("ctx._source.hack = 1", &json!({}), &mut Map::new()).is_err());
+    }
+
+    #[test]
+    fn chat_promotion_is_conditional_and_noops_on_other_statuses() {
+        // pending → promoted
+        let mut doc = doc_of(json!({ "slug": "a", "status": "pending" }));
+        let modified = apply_script(
+            SCRIPT_CHAT_PROMOTION,
+            &json!({ "newStatus": "approved" }),
+            &mut doc,
+        )
+        .unwrap();
+        assert!(modified);
+        assert_eq!(doc["status"], "approved");
+
+        // admin-curated in the meantime (status != pending) → noop, doc kept
+        let mut doc = doc_of(json!({ "slug": "b", "status": "rejected" }));
+        let modified = apply_script(
+            SCRIPT_CHAT_PROMOTION,
+            &json!({ "newStatus": "approved" }),
+            &mut doc,
+        )
+        .unwrap();
+        assert!(!modified);
+        assert_eq!(doc["status"], "rejected");
+
+        // missing status field → noop
+        let mut doc = doc_of(json!({ "slug": "c" }));
+        let modified = apply_script(
+            SCRIPT_CHAT_PROMOTION,
+            &json!({ "newStatus": "approved" }),
+            &mut doc,
+        )
+        .unwrap();
+        assert!(!modified);
+
+        // the _update wire result mirrors the noop (compute_update contract)
+        let stored = json!({ "slug": "d", "status": "approved" });
+        let out = compute_update(
+            Some(&stored),
+            &json!({ "script": { "source": SCRIPT_CHAT_PROMOTION, "params": { "newStatus": "approved" } } }),
+        )
+        .unwrap();
+        assert_eq!(out.result, "noop");
+        assert_eq!(out.doc["status"], "approved");
     }
 
     #[test]

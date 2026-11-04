@@ -722,6 +722,70 @@ fn fuzzy_match_finds_one_edit_distance_titles() {
 // chat-rs bodies
 // ---------------------------------------------------------------------------
 
+/// W2 (spec index-rs-optimization): kNN ranking must be invariant to the
+/// SCALE of both stored and query vectors — cosine semantics. A stored
+/// vector scaled 10× and an unnormalized query must hit exactly the same
+/// top hit with the same score as the unit-length pair.
+#[test]
+fn knn_scale_invariant_after_normalization() {
+    let mut docs = corpus();
+    // scale sonicblast's vector 10× at build time (build normalizes)
+    for d in docs.iter_mut() {
+        if d.slug == "asics-sonicblast" {
+            d.embedding = Some(vec![10.0, 0.0, 0.0, 0.0]);
+        }
+    }
+    let e = Engine::build(docs, None).expect("build engine");
+    // unnormalized query (norm 10) — same direction as [1,0,0,0]
+    let res = search(
+        &e,
+        &json!({
+            "size": 3,
+            "query": { "bool": { "must": [ { "knn": { "embedding": { "vector": [10.0, 0.0, 0.0, 0.0], "k": 3 } } } ] } }
+        }),
+    );
+    let slugs = hit_slugs(&res);
+    assert_eq!(slugs[0], "asics-sonicblast", "direction beats magnitude");
+    let score = res.pointer("/hits/hits/0/_score").unwrap().as_f64().unwrap();
+    assert!(score > 0.999, "cosine 1.0 → score (1+cos)/2 ≈ 1, got {score}");
+}
+
+/// W5 (spec index-rs-optimization): the autocomplete prefix tail is ranked
+/// by document frequency, not alphabetically. With 60 prefix candidates
+/// the old alphabetical take(50) cut "zz59" (last alphabetically) even
+/// though it is the most frequent term — the freq-ranked tail must keep it.
+#[test]
+fn autocomplete_prefix_tail_prefers_frequent_terms() {
+    let mut docs = Vec::new();
+    // 59 alphabetically-early candidates, each freq 1
+    for i in 0..59 {
+        docs.push(doc(
+            &format!("zz{i:02}"),
+            json!({ "title": format!("prod zz{i:02}") }),
+        ));
+    }
+    // zz59: freq 3 — would be cut by the alphabetical take(50)
+    for n in 0..3 {
+        docs.push(doc(
+            &format!("zz59-doc{n}"),
+            json!({ "title": format!("prod zz59 nr {n}") }),
+        ));
+    }
+    let e = Engine::build(docs, None).expect("build engine");
+    let res = search(
+        &e,
+        &json!({
+            "size": 100,
+            "query": { "match_phrase_prefix": { "title": { "query": "zz" } } }
+        }),
+    );
+    let slugs = hit_slugs(&res);
+    assert!(
+        slugs.iter().any(|s| s.starts_with("zz59")),
+        "frequent tail term zz59 must survive the 50-candidate cut: {slugs:?}"
+    );
+}
+
 #[test]
 fn chat_hybrid_bm25_and_knn_bodies() {
     let e = engine();
@@ -1207,9 +1271,12 @@ fn update_doc_as_upsert_searches_immediately_and_preserves_embedding() {
         &json!({ "query": { "multi_match": { "query": "sonicblast pro", "fields": ["title^3", "vendor"] } } }),
     );
     assert!(hit_slugs(&data).contains(&"asics-sonicblast".to_string()));
-    // the stored embedding survived the merge
+    // the stored embedding survived the merge — in its W2-normalized
+    // stored form (spec index-rs-optimization: rows are unit-length so
+    // the kNN scan is a plain dot product; direction preserved)
     let (_, emb) = e.get_doc("asics-sonicblast").unwrap();
-    assert_eq!(emb, Some(vec![0.1, 0.2, 0.3]));
+    let expected = crate::engine::l2_normalize(&[0.1, 0.2, 0.3]);
+    assert_eq!(emb, Some(expected));
     // _doc GET reflects the merged field
     let src = e.get_by_id("asics-sonicblast").unwrap();
     assert_eq!(src["title"], "ASICS Sonicblast PRO");
@@ -1434,7 +1501,10 @@ fn embedding_update_extracted_from_doc() {
     e.upsert_doc("asics-sonicblast", Value::Object(out.doc), out.embedding);
     let (src, emb) = e.get_doc("asics-sonicblast").unwrap();
     assert!(src.get("embedding").is_none());
-    assert_eq!(emb, Some(vec![0.4, 0.5]));
+    // W2 (spec index-rs-optimization): embeddings are STORED normalized —
+    // the direction matches the written vector, the norm is 1.
+    let expected = crate::engine::l2_normalize(&[0.4, 0.5]);
+    assert_eq!(emb, Some(expected));
 }
 
 /// _refresh, _mapping, _mget and scroll over the axum router (no PG needed).
@@ -1598,4 +1668,95 @@ async fn refresh_mapping_mget_and_scroll_endpoints() {
         }
     }
     assert_eq!(total, 12, "scrolled the whole corpus");
+}
+
+// -- index-efficiency spec: sweep + pending embeddings ------------------------
+
+#[test]
+fn upsert_without_embedding_keeps_stored_vector() {
+    let e = engine();
+    e.upsert_doc(
+        "asics-sonicblast",
+        json!({"title": "Asics Sonic-Blast v2", "type": "Inne", "currency": "PLN"}),
+        None,
+    );
+    let (_src, emb) = e.get_doc("asics-sonicblast").unwrap();
+    assert_eq!(emb, Some(vec![1.0, 0.0, 0.0, 0.0]));
+}
+
+#[test]
+fn knn_sees_pending_embedding_upsert() {
+    let e = engine();
+    // swap sonicblast's vector to a NEW direction — knn must score the
+    // pending row; with the stale matrix row it would rank last
+    e.upsert_doc(
+        "asics-sonicblast",
+        json!({"title": "Asics Sonic-Blast"}),
+        Some(vec![0.0, 1.0, 0.0, 0.0]),
+    );
+    let res = search(
+        &e,
+        &json!({
+            "query": {
+                "bool": {
+                    "must": [ { "knn": { "embedding": { "vector": [0.0, 1.0, 0.0, 0.0], "k": 3 } } } ]
+                }
+            },
+            "_source": { "excludes": ["embedding"] }
+        }),
+    );
+    let hits = res["hits"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "kNN k=3 over the 3 embedded docs");
+    assert_eq!(hits[0]["_id"], "asics-sonicblast");
+}
+
+#[test]
+fn sweep_removes_stale_leaked_tempdirs_only() {
+    use crate::engine::sweep_stale_tempdirs_with;
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let leaked = dir.path().join(".tmpAAAA11");
+    let live = dir.path().join(".tmpBBBB22");
+    fs::create_dir_all(&leaked).unwrap();
+    fs::create_dir_all(&live).unwrap();
+    fs::write(leaked.join("meta.json"), "{}").unwrap();
+    fs::write(dir.path().join("vectors.f32"), "hdr").unwrap();
+    // a large max age → nothing is stale: the race guard keeps fresh dirs
+    sweep_stale_tempdirs_with(dir.path(), std::time::Duration::from_secs(3600));
+    assert!(leaked.exists(), "dirs within max age must survive (race guard)");
+    assert!(live.exists());
+    // zero max age → everything .tmp* counts as stale and is swept
+    sweep_stale_tempdirs_with(dir.path(), std::time::Duration::ZERO);
+    assert!(!leaked.exists(), "stale leaked dir must be removed");
+    assert!(!live.exists());
+    assert!(
+        dir.path().join("vectors.f32").exists(),
+        "non-temp files must never be touched"
+    );
+}
+
+/// Cross-crate drift guard (spec chat-instant-discovery-publish): the chat
+/// service instant-publishes offers with a VERBATIM copy of the
+/// SCRIPT_APPEND_OFFER literal. The pattern interpreter matches by
+/// whitespace-normalized equality — if write.rs ever changes the pattern
+/// without the chat copy following, the chat bridge would fail loudly with
+/// 400s. This test fails at that exact moment, on the index side, by reading
+/// the literal straight out of the chat source.
+#[test]
+fn chat_bridge_append_offer_literal_stays_in_pattern_catalog() {
+    let chat_src = include_str!("../../truespotter-chat/src/discovery.rs");
+    let marker = "const SCRIPT_APPEND_OFFER: &str = \"";
+    let start = chat_src
+        .find(marker)
+        .expect("chat discovery.rs must carry SCRIPT_APPEND_OFFER");
+    let lit_start = start + marker.len();
+    let lit_end = chat_src[lit_start..]
+        .find("\";")
+        .expect("unterminated literal")
+        + lit_start;
+    let literal = &chat_src[lit_start..lit_end];
+
+    let pattern = crate::write::match_pattern(&crate::dsn::normalize_ws(literal))
+        .expect("the chat-side SCRIPT_APPEND_OFFER copy must stay in the pattern catalog");
+    assert_eq!(pattern, crate::write::Pattern::AppendOffer);
 }
