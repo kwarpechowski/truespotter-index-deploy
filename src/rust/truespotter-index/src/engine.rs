@@ -184,6 +184,58 @@ fn stem_pl(word: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// Synonyms (spec index-rs-synonyms) — query-time expansion for
+// match/multi_match. Pairs are in FOLDED+STEMMED form (the same space
+// `folded_tokens` produces). Bidirectional at lookup: expanding the QUERY
+// token covers both directions (query "telefon" hits docs with "smartfon"
+// and vice versa) without touching the index side.
+// ---------------------------------------------------------------------------
+
+const PL_SYNONYMS: &[(&str, &str)] = &[
+    ("but", "obuw"),
+    ("smartfon", "telefon"),
+    ("smartfon", "smartphone"),
+    ("laptop", "notebook"),
+    ("klawiatura", "keyboard"),
+    ("mysz", "mouse"),
+    ("sluchawk", "headphones"),
+    ("sluchawk", "headset"),
+    ("zegarek", "watch"),
+    ("rower", "bike"),
+    ("telewizor", "tv"),
+    ("pilot", "remote"),
+    ("kamera", "camera"),
+    ("kawa", "coffee"),
+];
+
+fn synonyms_of(token: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (a, b) in PL_SYNONYMS {
+        if token == *a {
+            out.push((*b).to_string());
+        } else if token == *b {
+            out.push((*a).to_string());
+        }
+    }
+    out
+}
+
+/// Group tokens with their synonyms: each group = [original, synonyms…].
+/// The GROUP is the msm unit (W3) — a doc matching any group member counts
+/// once, and `minimum_should_match` keeps its per-original-token semantics
+/// (expansion must not inflate the required count).
+fn expand_synonym_groups(tokens: Vec<String>) -> Vec<Vec<String>> {
+    tokens
+        .into_iter()
+        .map(|t| {
+            let mut g = vec![t.clone()];
+            g.extend(synonyms_of(&t));
+            g
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Custom tantivy tokenizer ("ts") — SimpleTokenizer + LowerCaser +
 // Polish-diacritics fold. Implemented against the trait directly so the
 // analyzer semantics are fully under our control (no API guessing).
@@ -327,6 +379,14 @@ impl VectorStore {
                             && fnn == n
                         {
                             if let Ok(map) = unsafe { memmap2::Mmap::map(&path_as_file(&path)) } {
+                                // Spec index-rs-knn-warm-start W1: fault in
+                                // ALL pages NOW — the first kNN query after
+                                // boot would otherwise pay ~10s of volume
+                                // reads on the 650 MB matrix (prod measured
+                                // 2026-11-04). One touch per 4K page;
+                                // best-effort, never fails the build (W3).
+                                let sum: u64 = map.chunks(4096).map(|c| c[0] as u64).sum();
+                                std::hint::black_box(sum);
                                 return VectorStore::Mmap {
                                     map,
                                     n,
@@ -1144,53 +1204,68 @@ impl Engine {
         if tokens.is_empty() {
             return BTreeMap::new();
         }
-        let mut per_token: Vec<BTreeMap<usize, f64>> = Vec::with_capacity(tokens.len());
-        for token in &tokens {
-            let mut m = BTreeMap::new();
-            if fuzzy {
-                // AUTO: len<=2 → 0, 3..=5 → 1, >5 → 2. Candidates share the
-                // first `prefix_length` chars (Lucene semantics).
-                let d = if token.len() <= 2 {
-                    0
-                } else if token.len() <= 5 {
-                    1
-                } else {
-                    2
-                };
-                let prefix: String = match prefix_length {
-                    Some(p) if p > 0 => token.chars().take(p).collect(),
-                    _ => String::new(),
-                };
-                if d == 0 {
-                    for (doc, s) in self.term_scores(field, token) {
-                        m.insert(doc, s);
-                    }
-                } else {
-                    // W1 (spec index-rs-optimization): borrow the dictionary
-                    // under the read guard instead of cloning the whole
-                    // BTreeSet — the old clone allocated tens of thousands
-                    // of Strings on EVERY fuzzy query. read-read RwLock
-                    // doesn't block; term_scores takes no terms lock.
-                    let terms = self.terms.read().expect("terms lock");
-                    let dict = &terms[self.field_name(field)];
-                    for cand in dict.iter() {
-                        if !prefix.is_empty() && !cand.starts_with(&prefix) {
-                            continue;
+        // Spec index-rs-synonyms W2: non-fuzzy match queries expand each
+        // token with its synonyms (group = original + synonyms, one map
+        // per GROUP). Fuzzy stays literal — typo tolerance is orthogonal.
+        let per_token: Vec<BTreeMap<usize, f64>> = if fuzzy {
+            tokens
+                .iter()
+                .map(|token| {
+                    let mut m = BTreeMap::new();
+                    // AUTO: len<=2 → 0, 3..=5 → 1, >5 → 2. Candidates share the
+                    // first `prefix_length` chars (Lucene semantics).
+                    let d = if token.len() <= 2 {
+                        0
+                    } else if token.len() <= 5 {
+                        1
+                    } else {
+                        2
+                    };
+                    let prefix: String = match prefix_length {
+                        Some(p) if p > 0 => token.chars().take(p).collect(),
+                        _ => String::new(),
+                    };
+                    if d == 0 {
+                        for (doc, s) in self.term_scores(field, token) {
+                            m.insert(doc, s);
                         }
-                        if levenshtein_within(token, cand, d) {
-                            for (doc, s) in self.term_scores(field, cand) {
-                                *m.entry(doc).or_insert(0.0) += s;
+                    } else {
+                        // W1 (spec index-rs-optimization): borrow the dictionary
+                        // under the read guard instead of cloning the whole
+                        // BTreeSet — the old clone allocated tens of thousands
+                        // of Strings on EVERY fuzzy query. read-read RwLock
+                        // doesn't block; term_scores takes no terms lock.
+                        let terms = self.terms.read().expect("terms lock");
+                        let dict = &terms[self.field_name(field)];
+                        for cand in dict.iter() {
+                            if !prefix.is_empty() && !cand.starts_with(&prefix) {
+                                continue;
+                            }
+                            if levenshtein_within(token, cand, d) {
+                                for (doc, s) in self.term_scores(field, cand) {
+                                    *m.entry(doc).or_insert(0.0) += s;
+                                }
                             }
                         }
                     }
-                }
-            } else {
-                for (doc, s) in self.term_scores(field, token) {
-                    m.insert(doc, s);
-                }
-            }
-            per_token.push(m);
-        }
+                    m
+                })
+                .collect()
+        } else {
+            expand_synonym_groups(tokens)
+                .iter()
+                .map(|group| {
+                    // union over the group members (original + synonyms)
+                    let mut m = BTreeMap::new();
+                    for token in group {
+                        for (doc, s) in self.term_scores(field, token) {
+                            *m.entry(doc).or_insert(0.0) += s;
+                        }
+                    }
+                    m
+                })
+                .collect()
+        };
         let mut out = BTreeMap::new();
         match operator {
             Operator::Or => {
@@ -1323,12 +1398,15 @@ impl Engine {
         operator: Operator,
         msm: &Option<Msm>,
     ) -> Result<BTreeMap<usize, f64>, String> {
-        let tokens = folded_tokens(text);
+        // Spec index-rs-synonyms W2: synonym groups — the GROUP is the
+        // msm unit, so minimum_should_match keeps its per-original-token
+        // semantics (W3).
+        let groups = expand_synonym_groups(folded_tokens(text));
         let mut best: BTreeMap<usize, f64> = BTreeMap::new();
         for (name, fboost) in fields {
-            // Per-field score: sum over matched tokens (operator), with the
-            // per-field minimum_should_match applied to the matched-token count.
-            let per_field = self.eval_text_match_with_msm(name, &tokens, operator, msm);
+            // Per-field score: sum over matched groups (operator), with the
+            // per-field minimum_should_match applied to the matched-group count.
+            let per_field = self.eval_text_match_with_msm(name, &groups, operator, msm);
             for (doc, s) in per_field {
                 let v = s * fboost;
                 let e = best.entry(doc).or_insert(0.0);
@@ -1343,27 +1421,36 @@ impl Engine {
     fn eval_text_match_with_msm(
         &self,
         field: &str,
-        tokens: &[String],
+        groups: &[Vec<String>],
         operator: Operator,
         msm: &Option<Msm>,
     ) -> BTreeMap<usize, f64> {
         let Some(tfield) = self.text_field(field) else {
             return BTreeMap::new();
         };
-        if tokens.is_empty() {
+        if groups.is_empty() {
             return BTreeMap::new();
         }
+        // required counts original TOKENS (== groups), not the expanded
+        // synonym members (spec index-rs-synonyms W3).
         let required = msm
             .as_ref()
-            .map(|m| m.required(tokens.len()))
+            .map(|m| m.required(groups.len()))
             .unwrap_or(match operator {
-                Operator::And => tokens.len(),
+                Operator::And => groups.len(),
                 Operator::Or => 0,
             });
         let mut matched_counts: BTreeMap<usize, usize> = BTreeMap::new();
         let mut sums: BTreeMap<usize, f64> = BTreeMap::new();
-        for token in tokens {
-            for (doc, s) in self.term_scores(tfield, token) {
+        for group in groups {
+            // union over the group members (original + synonyms)
+            let mut m: BTreeMap<usize, f64> = BTreeMap::new();
+            for token in group {
+                for (doc, s) in self.term_scores(tfield, token) {
+                    *m.entry(doc).or_insert(0.0) += s;
+                }
+            }
+            for (doc, s) in m {
                 *matched_counts.entry(doc).or_insert(0) += 1;
                 *sums.entry(doc).or_insert(0.0) += s;
             }

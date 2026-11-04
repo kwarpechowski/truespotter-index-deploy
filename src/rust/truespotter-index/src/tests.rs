@@ -850,6 +850,43 @@ fn polish_stemming_matches_inflections() {
 }
 
 
+/// Spec index-rs-synonyms (W4): a query term matches documents that use
+/// its synonym — both directions — without inflating msm (the synonym
+/// group is the msm unit, so a doc matching only one member still counts).
+#[test]
+fn synonyms_expand_match_queries_bidirectionally() {
+    let docs = vec![
+        doc("telefon", json!({ "title": "Telefon", "description": "klasyczne urządzenie" })),
+        doc("smartfon", json!({ "title": "Smartfon", "description": "nowoczesny" })),
+        doc("obuwie", json!({ "title": "Obuwie sportowe", "description": "dobre" })),
+        doc("buty", json!({ "title": "Buty do biegania", "description": "szybkie" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    // "smartfon" query → hits the doc titled "Telefon"
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "smartfon" } } }));
+    assert!(hit_slugs(&res).contains(&"telefon".to_string()), "{:?}", hit_slugs(&res));
+    // and the reverse direction: "telefon" query → hits "Smartfon"
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "telefon" } } }));
+    assert!(hit_slugs(&res).contains(&"smartfon".to_string()), "{:?}", hit_slugs(&res));
+    // "obuwie" (stemmed "obuw") ↔ "buty" (stemmed "but")
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "buty" } } }));
+    assert!(hit_slugs(&res).contains(&"obuwie".to_string()), "{:?}", hit_slugs(&res));
+    // multi_match with msm "1<100%": one real token must stay sufficient —
+    // the synonym expansion must NOT raise the required count (W3)
+    let res = search(
+        &e,
+        &json!({
+            "size": 10,
+            "query": { "multi_match": { "query": "obuwie", "fields": ["title^3", "description"], "operator": "or", "minimum_should_match": "1<100%" } }
+        }),
+    );
+    assert!(hit_slugs(&res).contains(&"buty".to_string()), "{:?}", hit_slugs(&res));
+    // no synonym → no phantom matches: a doc about kettles never surfaces
+    let res = search(&e, &json!({ "size": 10, "query": { "match": { "title": "czajnik" } } }));
+    assert!(hit_slugs(&res).is_empty(), "{:?}", hit_slugs(&res));
+}
+
+
 /// W5 (spec index-rs-optimization): the autocomplete prefix tail is ranked
 /// by document frequency, not alphabetically. With 60 prefix candidates
 /// the old alphabetical take(50) cut "zz59" (last alphabetically) even
