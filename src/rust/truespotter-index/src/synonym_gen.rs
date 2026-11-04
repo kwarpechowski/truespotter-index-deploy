@@ -177,19 +177,33 @@ pub async fn run_mining_once(state: &Arc<AppState>, cfg: &MinerConfig) -> usize 
         Ok(v) => v.iter().map(|t| t.clone()).collect(),
         Err(_) => return 0,
     };
-    let candidates: Vec<String> = engine
-        .top_terms("title", 2000)
-        .into_iter()
-        .filter(|(t, freq)| {
-            *freq >= 20
-                && t.chars().count() >= 5
-                && t.chars().all(|c| c.is_ascii_alphanumeric())
-                && !covered.contains(t)
-                && !mined.contains(t)
-        })
-        .map(|(t, _)| t)
-        .take(cfg.batch)
-        .collect();
+    // spec index-rs-query-mining W2: query-log terms FIRST — the
+    // vocabulary users actually type (incl. terms absent from the
+    // catalog — the biggest recall gaps); title terms only fill the rest.
+    let pass_filters = |t: &str| -> bool {
+        t.chars().count() >= 5
+            && t.chars().all(|c| c.is_ascii_alphanumeric())
+            && !covered.contains(t)
+            && !mined.contains(t)
+    };
+    let mut candidates: Vec<String> = Vec::with_capacity(cfg.batch);
+    let mut seen: HashSet<String> = HashSet::new();
+    for (t, count) in engine.query_terms(500) {
+        if count >= 5 && pass_filters(&t) && seen.insert(t.clone()) {
+            candidates.push(t);
+            if candidates.len() >= cfg.batch {
+                break;
+            }
+        }
+    }
+    for (t, freq) in engine.top_terms("title", 2000) {
+        if candidates.len() >= cfg.batch {
+            break;
+        }
+        if freq >= 20 && pass_filters(&t) && seen.insert(t.clone()) {
+            candidates.push(t);
+        }
+    }
 
     let mut new_rules = 0usize;
     for term in &candidates {

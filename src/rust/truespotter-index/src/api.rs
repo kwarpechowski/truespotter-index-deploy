@@ -556,6 +556,44 @@ pub async fn synonyms_list_handler(
     .into_response()
 }
 
+/// GET /{index}/_synonyms/_candidates — top query-log terms with counts
+/// and covered/mined flags (spec index-rs-query-mining W3, read-only).
+pub async fn synonyms_candidates_handler(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<String>,
+) -> Response {
+    let engine = state.engine.read().await.clone();
+    let (Some(pool), _) = (state.pool.clone(), ()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "no database configured" })),
+        )
+            .into_response();
+    };
+    let covered: std::collections::HashSet<String> = match crate::store::covered_synonym_terms(&pool).await {
+        Ok(v) => v.iter().map(|t| crate::engine::stem_pl(&crate::engine::fold_str(t)).to_string()).collect(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+    let mined: std::collections::HashSet<String> =
+        match crate::store::mined_synonym_terms(&pool).await {
+            Ok(v) => v.into_iter().collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+    let terms = engine
+        .query_terms(100)
+        .into_iter()
+        .map(|(t, count)| {
+            json!({
+                "term": t,
+                "count": count,
+                "covered": covered.contains(&t),
+                "mined": mined.contains(&t),
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "index": index, "terms": terms })).into_response()
+}
+
 /// POST /{index}/_synonyms — add a rule (admin-secret) and hot-apply.
 pub async fn synonyms_insert_handler(
     State(state): State<Arc<AppState>>,

@@ -359,6 +359,10 @@ async fn serve(config: Config, backfill: bool, force: bool) {
             post(api::synonyms_reload_handler),
         )
         .route(
+            "/:index/_synonyms/_candidates",
+            get(api::synonyms_candidates_handler),
+        )
+        .route(
             "/:index/_synonyms/:id",
             axum::routing::delete(api::synonyms_delete_handler),
         )

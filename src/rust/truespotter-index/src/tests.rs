@@ -944,6 +944,33 @@ fn llm_pair_parser_validates_and_filters() {
     assert!(crate::synonym_gen::parse_llm_pairs("kawa to kawa", "kawa").is_empty());
 }
 
+/// Spec index-rs-query-mining (W1/W2): match/multi_match queries feed the
+/// in-RAM term counter — the miner's priority candidate source.
+#[test]
+fn query_log_counts_tokens_per_match() {
+    let docs = vec![
+        doc("buty", json!({ "title": "Buty do biegania" })),
+        doc("telefon", json!({ "title": "Telefon" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    for _ in 0..5 {
+        search(&e, &json!({ "size": 1, "query": { "multi_match": { "query": "buty do biegania", "fields": ["title"] } } }));
+    }
+    search(&e, &json!({ "size": 1, "query": { "match": { "title": "telefon" } } }));
+    let terms = e.query_terms(10);
+    // every multi_match token counted 5x (stems: but, do, biegan)
+    assert_eq!(terms[0].1, 5, "{terms:?}");
+    let by_term: std::collections::HashMap<String, u64> = terms.into_iter().collect();
+    assert_eq!(by_term.get("but"), Some(&5), "{by_term:?}");
+    assert_eq!(by_term.get("biegan"), Some(&5), "{by_term:?}");
+    assert_eq!(by_term.get("telefon"), Some(&1), "{by_term:?}");
+    // fuzzy match queries feed the counter too
+    search(&e, &json!({ "size": 1, "query": { "match": { "title": { "query": "telefun", "fuzziness": "AUTO" } } } }));
+    let by_term: std::collections::HashMap<String, u64> =
+        e.query_terms(10).into_iter().collect();
+    assert_eq!(by_term.get("telefun"), Some(&1), "{by_term:?}");
+}
+
 /// Spec index-rs-dynamic-synonyms (W7): raw (diacritic) rule words stem at
 /// load — "słuchawki" and "sluchawki" queries both hit the same pair.
 #[test]
