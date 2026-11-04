@@ -750,6 +750,106 @@ fn knn_scale_invariant_after_normalization() {
     assert!(score > 0.999, "cosine 1.0 → score (1+cos)/2 ≈ 1, got {score}");
 }
 
+/// Spec index-rs-hybrid-normalization (W4): in a hybrid bool (kNN among
+/// the should clauses) a doc that is rank-1 of the kNN clause with NO text
+/// match must score at least 50% of a doc that is rank-1 of the text clause
+/// with no vector — the raw BM25 scale (unbounded) must not drown the kNN
+/// contribution ((1+cos)/2 ∈ [0,1]).
+#[test]
+fn hybrid_knn_not_drowned_by_bm25_scale() {
+    let mut docs = Vec::new();
+    // 40 filler docs make "telefon" rare → high-idf BM25 (raw score ~5+)
+    for i in 0..40 {
+        docs.push(doc(&format!("filler-{i}"), json!({ "title": "filler" })));
+    }
+    docs.push(doc(
+        "telefon-t",
+        json!({ "title": "Telefon", "embedding": [0.0, 0.0, 0.0, 0.0] }),
+    ));
+    docs.push(doc(
+        "xyz-k",
+        json!({ "title": "xyzxyz", "embedding": [1.0, 0.0, 0.0, 0.0] }),
+    ));
+    for d in docs.iter_mut() {
+        if d.doc.get("embedding").is_some() {
+            d.embedding = d
+                .doc
+                .get("embedding")
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect()
+                });
+        }
+    }
+    let e = Engine::build(docs, None).expect("build engine");
+    let res = search(
+        &e,
+        &json!({
+            "size": 10,
+            "query": {
+                "bool": {
+                    "should": [
+                        { "match": { "title": { "query": "telefon" } } },
+                        { "knn": { "embedding": { "vector": [1.0, 0.0, 0.0, 0.0], "k": 2 } } }
+                    ],
+                    "minimum_should_match": 1
+                }
+            }
+        }),
+    );
+    let score_of = |slug: &str| -> f64 {
+        res.pointer("/hits/hits")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["_id"] == slug)
+            .and_then(|h| h["_score"].as_f64())
+            .unwrap_or(0.0)
+    };
+    let t = score_of("telefon-t"); // text rank-1, knn bottom
+    let k = score_of("xyz-k"); // knn rank-1, no text match
+    assert!(t > 0.0 && k > 0.0, "both hybrid docs must match: t={t} k={k}");
+    assert!(
+        k >= 0.5 * t,
+        "kNN rank-1 contribution must survive the BM25 scale: k={k} t={t}"
+    );
+}
+
+/// Spec index-rs-pl-stemming (W5): inflected Polish query forms match the
+/// indexed base forms — both sides tokenize through the same stemmer.
+#[test]
+fn polish_stemming_matches_inflections() {
+    let docs = vec![
+        doc(
+            "buty-bieganie",
+            json!({ "title": "Buty do biegania", "description": "sukienka letnia" }),
+        ),
+        doc("telefon", json!({ "title": "Telefon" })),
+        doc("kawa", json!({ "title": "Kawa" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    // genitive plural of "buty" ("butów" → fold "butow" → strip "ow" → "but")
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "butów" } } }));
+    assert!(hit_slugs(&res).contains(&"buty-bieganie".to_string()));
+    // gerund inflection ("bieganie" ≡ "biegania" → both stem to "biegani")
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "bieganie" } } }));
+    assert!(hit_slugs(&res).contains(&"buty-bieganie".to_string()));
+    // singular/plural noun ("sukienki" ≡ "sukienka" → "sukienk")
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "description": "sukienki" } } }));
+    assert!(hit_slugs(&res).contains(&"buty-bieganie".to_string()));
+    // short stems pass through — "kaw" (from "kawa") does not collide with
+    // an unrelated word, and unstemed queries on no-suffix words still hit
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "kawy" } } }));
+    assert!(hit_slugs(&res).contains(&"kawa".to_string()));
+    // "telefonu" (genitive) matches "Telefon" ("telefonu" → "telefon")
+    let res = search(&e, &json!({ "size": 5, "query": { "match": { "title": "telefonu" } } }));
+    assert!(hit_slugs(&res).contains(&"telefon".to_string()));
+}
+
+
 /// W5 (spec index-rs-optimization): the autocomplete prefix tail is ranked
 /// by document frequency, not alphabetically. With 60 prefix candidates
 /// the old alphabetical take(50) cut "zz59" (last alphabetically) even

@@ -138,7 +138,49 @@ fn folded_tokens(s: &str) -> Vec<String> {
     if !cur.is_empty() {
         tokens.push(cur);
     }
-    tokens
+    // Spec index-rs-pl-stemming: conservative Polish case-ending strip,
+    // applied AFTER the fold (suffixes are matched in folded form —
+    // "ów" → "ow"). One place only — TsTokenizer, the term dictionaries,
+    // fuzzy enumeration, phrase and multi_match all read through this
+    // function, so index and query semantics stay identical.
+    tokens.iter().map(|t| stem_pl(t).to_string()).collect()
+}
+
+/// Polish inflectional suffixes in FOLDED (post-diacritic-fold) form,
+/// longest first. Case endings only (noun/adjective declension) — no
+/// derivational stripping (spec index-rs-pl-stemming W3).
+const PL_SUFFIXES: [&str; 22] = [
+    "iami", "ymi", "imi", "ego", "ach", "ami", "owi", "emu", "ych", "ich", "iej", "ow", "om", "em",
+    "ie", "ej", "y", "i", "a", "e", "u", "o",
+];
+
+/// Strip at most TWO inflectional suffixes (longest first per pass) from a
+/// folded token, keeping at least 3 characters of the stem after each
+/// pass (W2). The second pass converges the -nie/-nia gerund patterns
+/// ("bieganie" → "biegani" → "biegan" ≡ "biegania" → "biegan"). Words
+/// without a known ending and stems that would get too short pass through
+/// unchanged. Over-stemming hurts precision only — the same function
+/// tokenizes index and query, so recall never breaks.
+fn stem_pl(word: &str) -> &str {
+    let mut w = word;
+    for _ in 0..2 {
+        let mut stripped = w;
+        for suf in PL_SUFFIXES {
+            if w.len() > suf.len() && w.ends_with(suf) {
+                // suffixes are ASCII — the boundary is a valid char boundary
+                let stem = &w[..w.len() - suf.len()];
+                if stem.chars().count() >= 3 {
+                    stripped = stem;
+                    break;
+                }
+            }
+        }
+        if stripped == w {
+            break;
+        }
+        w = stripped;
+    }
+    w
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +452,43 @@ fn get_f64(v: &Value, key: &str) -> Option<f64> {
             .or_else(|| p.as_i64().map(|i| i as f64))
             .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
     })
+}
+
+/// Intentional per-clause weight for hybrid fusion (spec
+/// index-rs-hybrid-normalization W2): the clause boost, kNN = 1.0.
+fn clause_weight(q: &Query) -> f64 {
+    match q {
+        Query::Match { boost, .. }
+        | Query::MatchPhrase { boost, .. }
+        | Query::MatchPhrasePrefix { boost, .. }
+        | Query::MultiMatch { boost, .. } => *boost,
+        _ => 1.0,
+    }
+}
+
+/// Min-max score normalization to [0,1] per clause (spec
+/// index-rs-hybrid-normalization W1). A degenerate (constant) scale maps
+/// every matched doc to 1.0 — it matched maximally within its clause.
+fn min_max_normalize(m: &BTreeMap<usize, f64>) -> BTreeMap<usize, f64> {
+    if m.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for s in m.values() {
+        if *s < min {
+            min = *s;
+        }
+        if *s > max {
+            max = *s;
+        }
+    }
+    if max - min <= f64::EPSILON {
+        return m.keys().map(|d| (*d, 1.0)).collect();
+    }
+    m.iter()
+        .map(|(d, s)| (*d, (s - min) / (max - min)))
+        .collect()
 }
 
 /// Ad-hoc field lookup against the raw doc JSON (write-path fields the
@@ -939,6 +1018,21 @@ impl Engine {
             }
             maps
         };
+        // Spec index-rs-hybrid-normalization: when a should clause is kNN,
+        // the bool is a "hybrid" query. Raw BM25 (unbounded) and kNN
+        // ((1+cos)/2 in [0,1]) scales are incomparable — the naive sum lets
+        // one modality drown the other. Normalize each clause min-max to
+        // [0,1] and weight it by the clause boost (OpenSearch min_max
+        // normalization + weighted arithmetic combination, subset). Boosts
+        // are not double-applied: normalization erases the raw scale
+        // (boost included), the weight reintroduces it as intent.
+        let hybrid = b.should.iter().any(|c| matches!(c, Query::Knn { .. }));
+        let weights: Vec<f64> = b.should.iter().map(clause_weight).collect();
+        let should_maps: Vec<BTreeMap<usize, f64>> = if hybrid {
+            should_maps.iter().map(min_max_normalize).collect()
+        } else {
+            should_maps
+        };
         let mut out = BTreeMap::new();
         if b.should.is_empty() {
             for doc in base {
@@ -967,10 +1061,10 @@ impl Engine {
                 .and_then(|m| m.get(&doc))
                 .copied()
                 .unwrap_or(0.0);
-            for map in &should_maps {
+            for (ci, map) in should_maps.iter().enumerate() {
                 if let Some(s) = map.get(&doc) {
                     matched += 1;
-                    score += s;
+                    score += if hybrid { weights[ci] * s } else { *s };
                 }
             }
             if matched >= required {
