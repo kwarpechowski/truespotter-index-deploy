@@ -1192,12 +1192,28 @@ impl Engine {
                         .expect("pending lock poisoned")
                         .contains_key(&docno)
             }
-            _ => match Self::str_field_cow(rec, field) {
-                Some(s) => !s.is_empty(),
-                None => raw_value(rec, field)
-                    .map(|v| !v.is_null())
-                    .is_some_and(|v| v),
-            },
+            _ => {
+                // W1 (spec index-rs-lookup-fastpaths): DocRec struct
+                // fields NEVER need the raw-JSON fallback — a full-document
+                // serde parse PER RECORD was the dominant cost of every
+                // public search (exists("available") rides AvailableFilter
+                // on all records, eagerly). raw_value stays for ad-hoc
+                // fields outside DocRec (admin scans).
+                let f = field.trim_end_matches(".keyword");
+                match f {
+                    "available" => rec.available.is_some(),
+                    "price" => rec.price.is_some(),
+                    "trust_score" => rec.trust_score.is_some(),
+                    "trust_count" => rec.trust_count.is_some(),
+                    "created_at" => rec.created_at.is_some(),
+                    _ => match Self::str_field_cow(rec, f) {
+                        Some(s) => !s.is_empty(),
+                        None => raw_value(rec, f)
+                            .map(|v| !v.is_null())
+                            .is_some_and(|v| v),
+                    },
+                }
+            }
         }
     }
 
@@ -1351,7 +1367,16 @@ impl Engine {
                     }
                 }
                 TermValue::Bool(b) => {
-                    r.available == Some(*b) || raw_value(r, field).as_ref() == Some(&json_bool(*b))
+                    // W2 (spec index-rs-lookup-fastpaths): "available" is
+                    // fully covered by the record field — the raw fallback
+                    // would parse the FULL document JSON per mismatched
+                    // record. Other bool fields keep the raw fallback.
+                    if field == "available" || field == "available.keyword" {
+                        r.available == Some(*b)
+                    } else {
+                        r.available == Some(*b)
+                            || raw_value(r, field).as_ref() == Some(&json_bool(*b))
+                    }
                 }
                 TermValue::Num(n) => {
                     Self::num_field(r, field).is_some_and(|v| (v - n).abs() < f64::EPSILON * 4.0)
@@ -2055,17 +2080,17 @@ impl Engine {
     }
 
     /// Aggregation keyword values of a record (tags are multi-valued).
-    fn agg_values(rec: &DocRec, field: &str) -> Vec<String> {
+    /// W3 (spec index-rs-lookup-fastpaths): borrowed values — the old
+    /// Vec<String> clone cost ~340k allocations on a faceted search page.
+    fn agg_values<'a>(rec: &'a DocRec, field: &str) -> Vec<&'a str> {
         if rec.deleted {
             return Vec::new();
         }
         match field {
-            "tags" | "tags.keyword" => rec.tags.clone(),
-            "slug" | "slug.keyword" => vec![rec.slug.clone()],
-            "title" | "title.keyword" => vec![rec.title.clone()],
-            other => Self::str_field(rec, other)
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
+            "tags" | "tags.keyword" => rec.tags.iter().map(|s| s.as_str()).collect(),
+            "slug" | "slug.keyword" => vec![rec.slug.as_str()],
+            "title" | "title.keyword" => vec![rec.title.as_str()],
+            other => Self::str_field(rec, other).map(|s| vec![s]).unwrap_or_default(),
         }
     }
 
@@ -2083,20 +2108,27 @@ impl Engine {
                     size,
                     exclude,
                 } => {
-                    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-                    for d in docs {
-                        for v in Self::agg_values(&self.recs()[*d], field) {
-                            *counts.entry(v).or_insert(0) += 1;
+                    // W3 (spec index-rs-lookup-fastpaths): count with
+                    // borrowed keys — Strings are built only for the final
+                    // buckets (owned before the records guard drops)
+                    let mut buckets: Vec<(String, usize)> = {
+                        let records = self.recs();
+                        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                        for d in docs {
+                            for v in Self::agg_values(&records[*d], field) {
+                                *counts.entry(v).or_insert(0) += 1;
+                            }
                         }
-                    }
-                    let mut buckets: Vec<(String, usize)> = counts
-                        .into_iter()
-                        .filter(|(k, _)| {
-                            !exclude
-                                .iter()
-                                .any(|e| e.as_str() == k.as_str() || regex_is_match(e, k))
-                        })
-                        .collect();
+                        counts
+                            .into_iter()
+                            .map(|(k, c)| (k.to_string(), c))
+                            .collect()
+                    };
+                    buckets.retain(|(k, _)| {
+                        !exclude
+                            .iter()
+                            .any(|e| e.as_str() == k.as_str() || regex_is_match(e, k))
+                    });
                     buckets.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
                     buckets.truncate(*size);
                     out.insert(
