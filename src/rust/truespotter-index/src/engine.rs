@@ -983,15 +983,18 @@ impl Engine {
     /// or any of its synonyms)
     fn group_has_hits(&self, field_names: &[String], group: &SynonymGroup) -> bool {
         for name in field_names {
+            // multi_match field names carry boost suffixes ("title^3") —
+            // the terms dictionary is keyed by the bare field name
+            let bare = name.split('^').next().unwrap_or(name);
             for m in &group.members {
                 let hit = match m {
                     GroupMember::Term(t) => self
                         .terms
                         .read()
                         .expect("terms lock poisoned")
-                        .get(name.as_str())
+                        .get(bare)
                         .is_some_and(|s| s.contains(t)),
-                    GroupMember::Phrase(toks) => match self.text_field(name) {
+                    GroupMember::Phrase(toks) => match self.text_field(bare) {
                         Some(f) => !self.phrase_scores(f, toks).is_empty(),
                         None => false,
                     },
