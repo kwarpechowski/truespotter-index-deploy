@@ -419,6 +419,23 @@ async fn serve(config: Config, backfill: bool, force: bool) {
 /// during a rebuild the loop runs again so nothing is lost at the swap.
 fn spawn_vector_rebuilder(state: Arc<api::AppState>, data_dir: std::path::PathBuf) {
     tokio::spawn(async move {
+        // W2 (spec index-rs-rebuild-churn): the full rebuild is COMPACTION
+        // only — pending_vectors serves correct kNN reads until then. Gate
+        // by pending overflow (RAM drift) or a minimum interval; without
+        // this, routine script traffic (offers/status/category) triggered
+        // a ~90s full rebuild every ~90s, saturating the CPU and pushing
+        // search latency to seconds (prod measured 2026-11-05).
+        let pending_threshold: usize = std::env::var("VECTOR_REBUILD_PENDING_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000);
+        let min_interval = std::time::Duration::from_secs(
+            std::env::var("VECTOR_REBUILD_MIN_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
+        );
+        let mut last_rebuild = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             if !state
@@ -432,6 +449,15 @@ fn spawn_vector_rebuilder(state: Arc<api::AppState>, data_dir: std::path::PathBu
             state
                 .vectors_dirty
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            // gates: rebuild only when the pending sidecar is large or the
+            // minimum interval has passed; otherwise re-queue the flag
+            let pending = state.engine.read().await.pending_count();
+            if pending < pending_threshold && last_rebuild.elapsed() < min_interval {
+                state
+                    .vectors_dirty
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
             let Some(pool) = state.pool.clone() else {
                 continue;
             };
@@ -473,6 +499,7 @@ fn spawn_vector_rebuilder(state: Arc<api::AppState>, data_dir: std::path::PathBu
                     }
                 };
             *state.engine.write().await = Arc::new(built);
+            last_rebuild = std::time::Instant::now();
             tracing::info!(docs = n, "vector-matrix rebuild complete");
         }
     });

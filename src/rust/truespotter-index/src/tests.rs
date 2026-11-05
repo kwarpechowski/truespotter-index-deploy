@@ -1028,6 +1028,35 @@ fn query_log_counts_tokens_per_match() {
     assert_eq!(by_term.get("telefun"), Some(&(1, 0)), "{by_term:?}");
 }
 
+/// Spec index-rs-rebuild-churn (W3/W4): a deleted doc keeps its matrix
+/// row until compaction — kNN must never resurface the tombstone,
+/// regardless of when the (now gated) full rebuild happens.
+#[test]
+fn knn_never_returns_deleted_docs() {
+    let mut docs = Vec::new();
+    for i in 0..5 {
+        let mut d = doc(&format!("vec-{i}"), json!({ "title": format!("vec {i}") }));
+        let mut v = vec![0.0f32; 4];
+        v[i % 4] = 1.0;
+        d.embedding = Some(v);
+        docs.push(d);
+    }
+    let e = Engine::build(docs, None).expect("build engine");
+    // delete vec-2 (tombstone — matrix row stays until a full rebuild)
+    e.delete_doc("vec-2");
+    // kNN with the deleted doc's exact direction: it must NOT resurface
+    let res = search(
+        &e,
+        &json!({
+            "size": 10,
+            "query": { "bool": { "must": [ { "knn": { "embedding": { "vector": [0.0, 0.0, 1.0, 0.0], "k": 5 } } } ] } }
+        }),
+    );
+    let slugs = hit_slugs(&res);
+    assert!(!slugs.contains(&"vec-2".to_string()), "tombstone in kNN results: {slugs:?}");
+    assert_eq!(slugs.len(), 4, "the other 4 embedded docs remain: {slugs:?}");
+}
+
 /// Spec index-rs-zero-hit-mining (W1): a clause that matches NOTHING
 /// increments the miss counter for all its tokens — and miss-first
 /// ordering puts those terms at the top of the miner's candidate list.

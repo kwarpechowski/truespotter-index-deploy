@@ -769,7 +769,13 @@ pub async fn update_handler(
         Err(crate::write::UpdateError::Script(e)) => return script_error(&e, &index),
         Err(crate::write::UpdateError::Parse(e)) => return parsing_error(&e, &index),
     };
-    state.mark_vectors_dirty();
+    // W1 (spec index-rs-rebuild-churn): partial updates carry an embedding
+    // only when it actually changed — scripts never touch vectors, so no
+    // matrix rebuild is needed (the old unconditional dirty caused a full
+    // rebuild every ~90s under routine offer/status script traffic).
+    if outcome.embedding.is_some() {
+        state.mark_vectors_dirty();
+    }
     if let Err(e) = persist_upsert(
         &state,
         &id,
@@ -823,7 +829,9 @@ pub async fn update_by_query_handler(
     let total = slugs.len();
     let mut updated = 0usize;
     let mut failures: Vec<Value> = Vec::new();
-    state.mark_vectors_dirty();
+    // W1 (spec index-rs-rebuild-churn): script updates never change
+    // embeddings — no matrix rebuild needed (was: full rebuild per
+    // category/offer script batch).
     for slug in &slugs {
         let existing = engine.get_doc(slug).map(|(d, _)| d);
         match crate::write::compute_update(existing.as_ref(), &script_body) {
@@ -962,7 +970,11 @@ async fn index_doc(state: Arc<AppState>, index: String, id: String, body: Value)
     ensure_slug(&mut doc, &id);
     let embedding = crate::write::extract_embedding(&mut doc);
     let existed = engine.get_doc(&id).is_some();
-    state.mark_vectors_dirty();
+    // W1 (spec index-rs-rebuild-churn): only embedding-bearing upserts
+    // affect the vector matrix — a doc without an embedding adds no row.
+    if embedding.is_some() {
+        state.mark_vectors_dirty();
+    }
     if let Err(e) = persist_upsert(&state, &id, &doc, embedding.as_deref(), None).await {
         return os_error(
             StatusCode::SERVICE_UNAVAILABLE,

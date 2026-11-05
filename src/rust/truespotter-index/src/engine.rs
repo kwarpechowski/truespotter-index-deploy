@@ -1014,6 +1014,17 @@ impl Engine {
         self.recs().iter().filter(|r| !r.deleted).count()
     }
 
+    /// Pending (post-build) vector count — the rebuilder gate input
+    /// (spec index-rs-rebuild-churn W2): the sidecar is CORRECT for
+    /// reads, so a full rebuild is only compaction, worth doing when the
+    /// sidecar grows past a threshold or on a schedule.
+    pub fn pending_count(&self) -> usize {
+        self.pending_vectors
+            .read()
+            .expect("pending lock poisoned")
+            .len()
+    }
+
     /// Hot-swap the synonym dictionary (spec index-rs-dynamic-synonyms W4):
     /// takes effect on the very next query — no reindex, no rebuild.
     pub fn set_synonyms(&self, dict: SynonymDict) {
@@ -1949,6 +1960,11 @@ impl Engine {
             .into_par_iter()
             .map(|i| {
                 if !has_vec[i] || pending.contains_key(&i) {
+                    return f32::NEG_INFINITY;
+                }
+                // W3 (spec index-rs-rebuild-churn): tombstoned docs keep
+                // their matrix row until compaction — never resurface them
+                if self.recs()[i].deleted {
                     return f32::NEG_INFINITY;
                 }
                 let (r8, s_r) = self.vectors.row8(i).expect("row present");
