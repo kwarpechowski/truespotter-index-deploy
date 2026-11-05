@@ -1205,11 +1205,14 @@ impl Engine {
             }
             _ => {
                 // W1 (spec index-rs-lookup-fastpaths): DocRec struct
-                // fields NEVER need the raw-JSON fallback — a full-document
-                // serde parse PER RECORD was the dominant cost of every
-                // public search (exists("available") rides AvailableFilter
-                // on all records, eagerly). raw_value stays for ad-hoc
-                // fields outside DocRec (admin scans).
+                // fields NEVER need the raw-JSON fallback — the record is
+                // extracted from the same JSON, so an absent field means
+                // absent, PERIOD. The raw_value fallback here was the
+                // dominant cost of every public search: exists("status")
+                // / exists("available") ride the compound filters on all
+                // records eagerly, and every doc missing the field paid a
+                // full-document serde parse (10-100KB). raw_value stays
+                // ONLY for ad-hoc fields outside DocRec (admin scans).
                 let f = field.trim_end_matches(".keyword");
                 match f {
                     "available" => rec.available.is_some(),
@@ -1217,6 +1220,10 @@ impl Engine {
                     "trust_score" => rec.trust_score.is_some(),
                     "trust_count" => rec.trust_count.is_some(),
                     "created_at" => rec.created_at.is_some(),
+                    "slug" | "title" | "vendor" | "brand" | "type" | "category"
+                    | "category_path" | "currency" | "status" | "author" | "genre" | "id" => {
+                        Self::str_field(rec, f).is_some_and(|s| !s.is_empty())
+                    }
                     _ => match Self::str_field_cow(rec, f) {
                         Some(s) => !s.is_empty(),
                         None => raw_value(rec, f)
