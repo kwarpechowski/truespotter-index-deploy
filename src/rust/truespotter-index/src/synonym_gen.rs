@@ -72,7 +72,7 @@ fn stem_of(raw: &str) -> String {
 /// Accepts a bare JSON object with {"pairs": [[side_a, side_b], ...]};
 /// markdown fences tolerated. Each side: 1-4 words, 2-40 chars each;
 /// sides must differ after stemming.
-pub fn parse_llm_pairs(content: &str, term: &str) -> Vec<(Vec<String>, Vec<String>)> {
+pub fn parse_llm_pairs(content: &str, term: &str) -> Vec<(Vec<String>, Vec<String>, Option<String>)> {
     // strip markdown code fences if the model added them
     let body = content
         .trim()
@@ -119,7 +119,8 @@ pub fn parse_llm_pairs(content: &str, term: &str) -> Vec<(Vec<String>, Vec<Strin
             continue;
         }
         let _ = term;
-        out.push((a, b));
+        // spec index-rs-category-scoped-synonyms W4: mined rules are global
+        out.push((a, b, None));
     }
     out
 }
@@ -127,7 +128,7 @@ pub fn parse_llm_pairs(content: &str, term: &str) -> Vec<(Vec<String>, Vec<Strin
 async fn generate_pairs(
     cfg: &MinerConfig,
     term: &str,
-) -> Result<Vec<(Vec<String>, Vec<String>)>, String> {
+) -> Result<Vec<(Vec<String>, Vec<String>, Option<String>)>, String> {
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .read_timeout(std::time::Duration::from_secs(60))
@@ -212,8 +213,8 @@ pub async fn run_mining_once(state: &Arc<AppState>, cfg: &MinerConfig) -> usize 
         match generate_pairs(cfg, term).await {
             Ok(pairs) => {
                 let n_pairs = pairs.len();
-                for (a, b) in pairs {
-                    match crate::store::insert_synonym_rule(&pool, &a, &b, None).await {
+                for (a, b, category) in pairs {
+                    match crate::store::insert_synonym_rule(&pool, &a, &b, category.as_deref()).await {
                         Ok(_) => new_rules += 1,
                         Err(e) => tracing::warn!(error = %e, term = %term, "synonym insert failed"),
                     }

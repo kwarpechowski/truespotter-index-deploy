@@ -128,22 +128,26 @@ pub struct SynonymRule {
     pub id: i64,
     pub terms_a: Vec<String>,
     pub terms_b: Vec<String>,
+    /// spec index-rs-category-scoped-synonyms W3: rule scope — None =
+    /// global (applies to every search)
+    pub category: Option<String>,
 }
 
 /// All enabled rules (spec index-rs-dynamic-synonyms W2 loading).
 pub async fn load_synonym_rules(pool: &PgPool) -> Result<Vec<SynonymRule>, String> {
-    let rows = sqlx::query_as::<_, (i64, Vec<String>, Vec<String>)>(
-        "SELECT id, terms_a, terms_b FROM synonym_rules WHERE enabled ORDER BY id",
+    let rows = sqlx::query_as::<_, (i64, Vec<String>, Vec<String>, Option<String>)>(
+        "SELECT id, terms_a, terms_b, category FROM synonym_rules WHERE enabled ORDER BY id",
     )
     .fetch_all(pool)
     .await
     .map_err(|e| format!("load synonym_rules: {e}"))?;
     Ok(rows
         .into_iter()
-        .map(|(id, terms_a, terms_b)| SynonymRule {
+        .map(|(id, terms_a, terms_b, category)| SynonymRule {
             id,
             terms_a,
             terms_b,
+            category,
         })
         .collect())
 }
@@ -207,7 +211,9 @@ pub async fn log_synonym_gen(pool: &PgPool, term: &str) -> Result<(), String> {
 pub async fn load_synonym_dict(pool: &PgPool) -> Result<crate::engine::SynonymDict, String> {
     let rules = load_synonym_rules(pool).await?;
     Ok(crate::engine::SynonymDict::from_raw(
-        rules.into_iter().map(|r| (r.terms_a, r.terms_b)),
+        rules
+            .into_iter()
+            .map(|r| (r.terms_a, r.terms_b, r.category)),
     ))
 }
 

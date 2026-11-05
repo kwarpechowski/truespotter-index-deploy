@@ -489,7 +489,9 @@ async fn apply_synonyms_to_engine(state: &AppState) -> Result<usize, String> {
     let rules = crate::store::load_synonym_rules(&pool).await?;
     let n = rules.len();
     let dict = crate::engine::SynonymDict::from_raw(
-        rules.into_iter().map(|r| (r.terms_a, r.terms_b)),
+        rules
+            .into_iter()
+            .map(|r| (r.terms_a, r.terms_b, r.category)),
     );
     let engine = state.engine.read().await.clone();
     engine.set_synonyms(dict);

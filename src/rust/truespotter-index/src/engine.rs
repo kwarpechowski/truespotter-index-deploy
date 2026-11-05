@@ -201,9 +201,32 @@ pub(crate) fn stem_pl(word: &str) -> &str {
 // token SEQUENCE: len 1 -> Term, len > 1 -> adjacent Phrase.
 // ---------------------------------------------------------------------------
 
+/// One synonym rule: two stemmed token-sequence sides + optional category
+/// scope (spec index-rs-category-scoped-synonyms W2 — folded form).
+struct SynPair {
+    a: Vec<String>,
+    b: Vec<String>,
+    category: Option<String>,
+}
+
 pub struct SynonymDict {
-    /// bidirectional (side_a, side_b) stemmed token sequences
-    pairs: Vec<(Vec<String>, Vec<String>)>,
+    pairs: Vec<SynPair>,
+}
+
+/// Per-search context (spec index-rs-category-scoped-synonyms W1) —
+/// the category terms extracted from the query's top-level filter, in
+/// folded form. Scoped synonym rules apply only when their category is
+/// in here; global rules always apply.
+#[derive(Default)]
+pub struct QueryCtx {
+    pub categories: Vec<String>,
+}
+
+impl QueryCtx {
+    /// No category filter — only global rules apply.
+    pub fn global() -> Self {
+        Self::default()
+    }
 }
 
 impl SynonymDict {
@@ -212,15 +235,23 @@ impl SynonymDict {
     }
 
     /// Build from raw (unstemmed) rule pairs — each token folded+stemmed
-    /// individually (spec index-rs-dynamic-synonyms W2).
-    pub fn from_raw(pairs: impl IntoIterator<Item = (Vec<String>, Vec<String>)>) -> Self {
+    /// individually (spec index-rs-dynamic-synonyms W2); the category is
+    /// folded for comparison against QueryCtx (spec
+    /// index-rs-category-scoped-synonyms W2).
+    pub fn from_raw(
+        pairs: impl IntoIterator<Item = (Vec<String>, Vec<String>, Option<String>)>,
+    ) -> Self {
         let stem_seq = |v: &[String]| -> Vec<String> {
             v.iter().map(|w| stem_pl(&fold_str(w)).to_string()).collect()
         };
         Self {
             pairs: pairs
                 .into_iter()
-                .map(|(a, b)| (stem_seq(&a), stem_seq(&b)))
+                .map(|(a, b, c)| SynPair {
+                    a: stem_seq(&a),
+                    b: stem_seq(&b),
+                    category: c.map(|cat| fold_str(&cat)),
+                })
                 .collect(),
         }
     }
@@ -231,6 +262,14 @@ impl SynonymDict {
 
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
+    }
+
+    /// Does the rule apply in this context? (W2) Global rules always;
+    /// scoped rules only when the query filters to their category.
+    fn applies(ctx: &QueryCtx, category: &Option<String>) -> bool {
+        category
+            .as_ref()
+            .is_none_or(|c| ctx.categories.contains(c))
     }
 }
 
@@ -255,7 +294,11 @@ struct SynonymGroup {
 /// (expansion must not inflate the required count). A matched
 /// multi-word phrase MERGES its token positions into ONE group
 /// (semantically one concept). Longest phrase match wins (greedy).
-fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<SynonymGroup> {
+fn expand_synonym_groups(
+    dict: &SynonymDict,
+    ctx: &QueryCtx,
+    tokens: Vec<String>,
+) -> Vec<SynonymGroup> {
     let push_alt = |g: &mut Vec<GroupMember>, alt: &[String]| {
         if alt.len() == 1 {
             g.push(GroupMember::Term(alt[0].clone()));
@@ -268,8 +311,11 @@ fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Synonym
     while i < tokens.len() {
         // longest phrase side match at the current position (greedy)
         let mut matched: Option<(usize, usize)> = None;
-        for (pi, (a, b)) in dict.pairs.iter().enumerate() {
-            for (seq, _alt) in [(a.as_slice(), b.as_slice()), (b.as_slice(), a.as_slice())] {
+        for (pi, p) in dict.pairs.iter().enumerate() {
+            if !SynonymDict::applies(ctx, &p.category) {
+                continue;
+            }
+            for (seq, _alt) in [(p.a.as_slice(), p.b.as_slice()), (p.b.as_slice(), p.a.as_slice())] {
                 let len = seq.len();
                 if len >= 2
                     && i + len <= tokens.len()
@@ -281,17 +327,17 @@ fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Synonym
             }
         }
         if let Some((pi, _len)) = matched {
-            let (a, b) = &dict.pairs[pi];
+            let p = &dict.pairs[pi];
             // the matched side becomes the Phrase; the other side joins
             // the group as the alternative (term or phrase)
             let side_fits = |seq: &[String]| {
                 i + seq.len() <= tokens.len()
                     && seq.iter().zip(&tokens[i..i + seq.len()]).all(|(s, t)| s == t)
             };
-            let (seq, alt) = if side_fits(a) {
-                (a.as_slice(), b.as_slice())
+            let (seq, alt) = if side_fits(&p.a) {
+                (p.a.as_slice(), p.b.as_slice())
             } else {
-                (b.as_slice(), a.as_slice())
+                (p.b.as_slice(), p.a.as_slice())
             };
             let mut members = vec![GroupMember::Phrase(seq.to_vec())];
             push_alt(&mut members, alt);
@@ -304,8 +350,11 @@ fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Synonym
         // this token (the other side joins the group — term or phrase)
         let t = &tokens[i];
         let mut members = vec![GroupMember::Term(t.clone())];
-        for (a, b) in &dict.pairs {
-            for (seq, alt) in [(a.as_slice(), b.as_slice()), (b.as_slice(), a.as_slice())] {
+        for p in &dict.pairs {
+            if !SynonymDict::applies(ctx, &p.category) {
+                continue;
+            }
+            for (seq, alt) in [(p.a.as_slice(), p.b.as_slice()), (p.b.as_slice(), p.a.as_slice())] {
                 if seq.len() == 1 && &seq[0] == t {
                     push_alt(&mut members, alt);
                 }
@@ -800,6 +849,36 @@ pub(crate) fn sweep_stale_tempdirs_with(dir: &std::path::Path, max_age: std::tim
     }
 }
 
+/// Walk the query for category filter terms (spec
+/// index-rs-category-scoped-synonyms W1) — top-level bool filter/must
+/// chains (including nested bools), values folded for QueryCtx compare.
+fn collect_categories(q: &Query, out: &mut Vec<String>) {
+    fn walk_filter(q: &Query, out: &mut Vec<String>) {
+        match q {
+            Query::Bool(b) => {
+                for clause in b.filter.iter().chain(b.must.iter()) {
+                    walk_filter(clause, out);
+                }
+            }
+            Query::Term { field, value } => {
+                let f = field.trim_end_matches(".keyword");
+                if f == "type" || f == "category" {
+                    if let crate::dsn::TermValue::Str(s) = value {
+                        let folded = fold_str(s);
+                        if !out.contains(&folded) {
+                            out.push(folded);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Query::Bool(_) = q {
+        walk_filter(q, out);
+    }
+}
+
 impl Engine {
     /// Build the engine from corpus docs (PG rows or synthetic test data).
     /// `data_dir` is used for the vector matrix persistence (mmap); the
@@ -1126,7 +1205,7 @@ impl Engine {
 
     /// Evaluate a query → matching docno → score. Filter-position clauses
     /// get uniform scores (the caller ignores them).
-    fn eval(&self, q: &Query) -> Result<BTreeMap<usize, f64>, String> {
+    fn eval(&self, q: &Query, ctx: &QueryCtx) -> Result<BTreeMap<usize, f64>, String> {
         match q {
             Query::MatchAll => Ok({
                 let records = self.recs();
@@ -1183,7 +1262,7 @@ impl Engine {
                     .map(|(i, _)| (i, 1.0))
                     .collect())
             }
-            Query::Bool(b) => self.eval_bool(b),
+            Query::Bool(b) => self.eval_bool(b, ctx),
             Query::Match {
                 field,
                 text,
@@ -1192,7 +1271,14 @@ impl Engine {
                 boost,
                 operator,
             } => Ok(self
-                .eval_text_match(field, text, fuzziness.is_some(), *prefix_length, *operator)
+                .eval_text_match(
+                    field,
+                    text,
+                    fuzziness.is_some(),
+                    *prefix_length,
+                    *operator,
+                    ctx,
+                )
                 .into_iter()
                 .map(|(k, v)| (k, v * boost))
                 .collect()),
@@ -1212,7 +1298,7 @@ impl Engine {
                 boost,
                 operator,
                 minimum_should_match,
-            } => self.eval_multi_match(text, fields, *boost, *operator, minimum_should_match),
+            } => self.eval_multi_match(text, fields, *boost, *operator, minimum_should_match, ctx),
             Query::Knn { field, vector, k } => self.eval_knn(field, vector, *k),
             Query::FunctionScore {
                 query,
@@ -1220,7 +1306,7 @@ impl Engine {
                 random_seed,
                 boost_mode_sum,
             } => {
-                let inner = self.eval(query)?;
+                let inner = self.eval(query, ctx)?;
                 let use_script = script_score.is_some();
                 let mut out = BTreeMap::new();
                 for (docno, score) in inner {
@@ -1278,11 +1364,15 @@ impl Engine {
         out
     }
 
-    fn eval_bool(&self, b: &crate::dsn::BoolQuery) -> Result<BTreeMap<usize, f64>, String> {
+    fn eval_bool(
+        &self,
+        b: &crate::dsn::BoolQuery,
+        ctx: &QueryCtx,
+    ) -> Result<BTreeMap<usize, f64>, String> {
         // must: intersect, summing scores.
         let mut must: Option<BTreeMap<usize, f64>> = None;
         for clause in &b.must {
-            let r = self.eval(clause)?;
+            let r = self.eval(clause, ctx)?;
             must = Some(match must {
                 None => r,
                 Some(acc) => {
@@ -1299,7 +1389,7 @@ impl Engine {
         // filter: intersect as a set.
         let mut filter: Option<Vec<usize>> = None;
         for clause in &b.filter {
-            let r = self.eval(clause)?;
+            let r = self.eval(clause, ctx)?;
             filter = Some(match filter {
                 None => r.keys().copied().collect(),
                 Some(acc) => acc.into_iter().filter(|d| r.contains_key(d)).collect(),
@@ -1322,14 +1412,14 @@ impl Engine {
         };
         // must_not: subtract.
         for clause in &b.must_not {
-            let r = self.eval(clause)?;
+            let r = self.eval(clause, ctx)?;
             base.retain(|d| !r.contains_key(d));
         }
         // should: count matched clauses per doc, sum scores.
         let should_maps: Vec<BTreeMap<usize, f64>> = {
             let mut maps = Vec::new();
             for clause in &b.should {
-                maps.push(self.eval(clause)?);
+                maps.push(self.eval(clause, ctx)?);
             }
             maps
         };
@@ -1451,6 +1541,7 @@ impl Engine {
         fuzzy: bool,
         prefix_length: Option<usize>,
         operator: Operator,
+        ctx: &QueryCtx,
     ) -> BTreeMap<usize, f64> {
         let field_name = field.to_string();
         let Some(field) = self.text_field(field) else {
@@ -1514,7 +1605,7 @@ impl Engine {
         } else {
             let groups = {
                 let dict = self.synonyms.read().expect("synonyms lock poisoned");
-                expand_synonym_groups(&dict, tokens)
+                expand_synonym_groups(&dict, ctx, tokens)
             };
             // spec index-rs-zero-hit-mining: per-TOKEN miss — the group's
             // concept matched nothing in the queried field
@@ -1697,6 +1788,7 @@ impl Engine {
         boost: f64,
         operator: Operator,
         msm: &Option<Msm>,
+        ctx: &QueryCtx,
     ) -> Result<BTreeMap<usize, f64>, String> {
         // Spec index-rs-synonyms W2: synonym groups — the GROUP is the
         // msm unit, so minimum_should_match keeps its per-original-token
@@ -1704,7 +1796,7 @@ impl Engine {
         let query_tokens = folded_tokens(text);
         let groups = {
             let dict = self.synonyms.read().expect("synonyms lock poisoned");
-            expand_synonym_groups(&dict, query_tokens.clone())
+            expand_synonym_groups(&dict, ctx, query_tokens.clone())
         };
         // spec index-rs-zero-hit-mining: per-TOKEN miss — the group's
         // concept matched nothing across ALL queried fields
@@ -1981,6 +2073,7 @@ impl Engine {
         &self,
         aggs: &[(String, crate::dsn::Agg)],
         docs: &[usize],
+        ctx: &QueryCtx,
     ) -> Result<Value, String> {
         let mut out = Map::new();
         for (name, agg) in aggs {
@@ -2040,12 +2133,12 @@ impl Engine {
                     );
                 }
                 crate::dsn::Agg::Filter { filter, aggs } => {
-                    let r = self.eval(filter)?;
+                    let r = self.eval(filter, ctx)?;
                     let sub_docs: Vec<usize> =
                         docs.iter().copied().filter(|d| r.contains_key(d)).collect();
                     let mut body = Map::new();
                     body.insert("doc_count".into(), json!(sub_docs.len()));
-                    let sub = self.eval_aggs(aggs, &sub_docs)?;
+                    let sub = self.eval_aggs(aggs, &sub_docs, ctx)?;
                     if let Value::Object(so) = sub {
                         for (k, v) in so {
                             body.insert(k, v);
@@ -2062,7 +2155,13 @@ impl Engine {
 
     pub fn search(&self, req: &SearchRequest) -> Result<SearchOutcome, String> {
         let start = Instant::now();
-        let matched = self.eval(&req.query)?;
+        // spec index-rs-category-scoped-synonyms W1: extract the category
+        // terms from the query's filters once per search — scoped synonym
+        // rules apply only under a matching category filter
+        let mut categories: Vec<String> = Vec::new();
+        collect_categories(&req.query, &mut categories);
+        let ctx = QueryCtx { categories };
+        let matched = self.eval(&req.query, &ctx)?;
         let mut docnos: Vec<usize> = matched.keys().copied().collect();
         let has_score_sort = req.sort.iter().any(|s| s.key == "_score");
 
@@ -2165,7 +2264,7 @@ impl Engine {
             None
         } else {
             let all: Vec<usize> = keyed.iter().map(|(d, _)| *d).collect();
-            Some(self.eval_aggs(&req.aggs, &all)?)
+            Some(self.eval_aggs(&req.aggs, &all, &ctx)?)
         };
 
         Ok(SearchOutcome {
@@ -2219,7 +2318,7 @@ impl Engine {
     /// Slugs matching a query (the _update_by_query/_delete_by_query
     /// selection set).
     pub fn select_slugs(&self, q: &crate::dsn::Query) -> Result<Vec<String>, String> {
-        let matched = self.eval(q)?;
+        let matched = self.eval(q, &QueryCtx::global())?;
         let records = self.recs();
         Ok(matched
             .keys()
