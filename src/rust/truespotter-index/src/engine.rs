@@ -241,13 +241,21 @@ enum GroupMember {
     Phrase(Vec<String>),
 }
 
+/// One msm unit: the expansion members plus the ORIGINAL token indices
+/// this group covers (spec index-rs-zero-hit-mining — per-token miss
+/// attribution).
+struct SynonymGroup {
+    members: Vec<GroupMember>,
+    tokens: Vec<usize>,
+}
+
 /// Group tokens with their dictionary synonyms: each group is one msm
 /// UNIT — a doc matching any group member counts once, and
 /// `minimum_should_match` keeps its per-original-token semantics
 /// (expansion must not inflate the required count). A matched
 /// multi-word phrase MERGES its token positions into ONE group
 /// (semantically one concept). Longest phrase match wins (greedy).
-fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Vec<GroupMember>> {
+fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<SynonymGroup> {
     let push_alt = |g: &mut Vec<GroupMember>, alt: &[String]| {
         if alt.len() == 1 {
             g.push(GroupMember::Term(alt[0].clone()));
@@ -255,7 +263,7 @@ fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Vec<Gro
             g.push(GroupMember::Phrase(alt.to_vec()));
         }
     };
-    let mut groups: Vec<Vec<GroupMember>> = Vec::new();
+    let mut groups: Vec<SynonymGroup> = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
         // longest phrase side match at the current position (greedy)
@@ -285,24 +293,28 @@ fn expand_synonym_groups(dict: &SynonymDict, tokens: Vec<String>) -> Vec<Vec<Gro
             } else {
                 (b.as_slice(), a.as_slice())
             };
-            let mut g = vec![GroupMember::Phrase(seq.to_vec())];
-            push_alt(&mut g, alt);
-            groups.push(g);
+            let mut members = vec![GroupMember::Phrase(seq.to_vec())];
+            push_alt(&mut members, alt);
+            let span: Vec<usize> = (i..i + seq.len()).collect();
+            groups.push(SynonymGroup { members, tokens: span });
             i += seq.len();
             continue;
         }
         // single token: original + pairs where either side is exactly
         // this token (the other side joins the group — term or phrase)
         let t = &tokens[i];
-        let mut g = vec![GroupMember::Term(t.clone())];
+        let mut members = vec![GroupMember::Term(t.clone())];
         for (a, b) in &dict.pairs {
             for (seq, alt) in [(a.as_slice(), b.as_slice()), (b.as_slice(), a.as_slice())] {
                 if seq.len() == 1 && &seq[0] == t {
-                    push_alt(&mut g, alt);
+                    push_alt(&mut members, alt);
                 }
             }
         }
-        groups.push(g);
+        groups.push(SynonymGroup {
+            members,
+            tokens: vec![i],
+        });
         i += 1;
     }
     groups
@@ -934,12 +946,12 @@ impl Engine {
     /// match/multi_match clause, with the clause-level miss flag (the
     /// clause matched NOTHING). Amortized cap: past 20k unique terms the
     /// map prunes to the top 10k by count.
-    fn record_query_tokens(&self, tokens: &[String], miss: bool) {
+    fn record_query_tokens(&self, tokens: &[String], miss: &[bool]) {
         let mut log = self.query_log.lock().expect("query log lock poisoned");
-        for t in tokens {
+        for (i, t) in tokens.iter().enumerate() {
             let e = log.entry(t.clone()).or_insert((0, 0));
             e.0 += 1;
-            if miss {
+            if miss.get(i).copied().unwrap_or(false) {
                 e.1 += 1;
             }
         }
@@ -963,6 +975,33 @@ impl Engine {
         out.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
         out.truncate(limit);
         out
+    }
+
+    /// Does this group's concept exist in the queried fields at all?
+    /// (spec index-rs-zero-hit-mining — per-token miss attribution: a
+    /// group with no hits anywhere = the catalog does not know the word,
+    /// or any of its synonyms)
+    fn group_has_hits(&self, field_names: &[String], group: &SynonymGroup) -> bool {
+        for name in field_names {
+            for m in &group.members {
+                let hit = match m {
+                    GroupMember::Term(t) => self
+                        .terms
+                        .read()
+                        .expect("terms lock poisoned")
+                        .get(name.as_str())
+                        .is_some_and(|s| s.contains(t)),
+                    GroupMember::Phrase(toks) => match self.text_field(name) {
+                        Some(f) => !self.phrase_scores(f, toks).is_empty(),
+                        None => false,
+                    },
+                };
+                if hit {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Top dictionary terms of a text field by document frequency (spec
@@ -1410,6 +1449,7 @@ impl Engine {
         prefix_length: Option<usize>,
         operator: Operator,
     ) -> BTreeMap<usize, f64> {
+        let field_name = field.to_string();
         let Some(field) = self.text_field(field) else {
             return BTreeMap::new(); // lenient: unmapped field → no hits
         };
@@ -1418,8 +1458,9 @@ impl Engine {
             return BTreeMap::new();
         }
         // spec index-rs-query-mining W1: record the vocabulary users type.
-        // Zero-hit flag needs the result — recorded after evaluation below.
+        // Zero-hit flags need the groups/result — recorded after evaluation.
         let query_tokens_for_log = tokens.clone();
+        let mut miss_stash: Option<Vec<bool>> = None;
         // Spec index-rs-synonyms W2: non-fuzzy match queries expand each
         // token with its synonyms (group = original + synonyms, one map
         // per GROUP). Fuzzy stays literal — typo tolerance is orthogonal.
@@ -1472,12 +1513,25 @@ impl Engine {
                 let dict = self.synonyms.read().expect("synonyms lock poisoned");
                 expand_synonym_groups(&dict, tokens)
             };
+            // spec index-rs-zero-hit-mining: per-TOKEN miss — the group's
+            // concept matched nothing in the queried field
+            for g in &groups {
+                let miss = !self.group_has_hits(std::slice::from_ref(&field_name), g);
+                if miss {
+                    miss_stash.get_or_insert_with(|| vec![false; query_tokens_for_log.len()]);
+                    for idx in &g.tokens {
+                        if let Some(f) = miss_stash.as_mut().and_then(|v| v.get_mut(*idx)) {
+                            *f = true;
+                        }
+                    }
+                }
+            }
             groups
                 .iter()
                 .map(|group| {
                     // union over the group members (terms + phrases)
                     let mut m = BTreeMap::new();
-                    for member in group {
+                    for member in &group.members {
                         let pairs = match member {
                             GroupMember::Term(t) => self.term_scores(field, t),
                             GroupMember::Phrase(toks) => self.phrase_scores(field, toks),
@@ -1515,8 +1569,13 @@ impl Engine {
                 }
             }
         }
-        // spec index-rs-zero-hit-mining W1: miss = this clause matched nothing
-        self.record_query_tokens(&query_tokens_for_log, out.is_empty());
+        // spec index-rs-zero-hit-mining W1: per-token miss flags (non-fuzzy
+        // stash) or clause-level flag (fuzzy path)
+        let miss_flags: Vec<bool> = match miss_stash {
+            Some(flags) => flags,
+            None => vec![out.is_empty(); query_tokens_for_log.len()],
+        };
+        self.record_query_tokens(&query_tokens_for_log, &miss_flags);
         out
     }
 
@@ -1644,6 +1703,19 @@ impl Engine {
             let dict = self.synonyms.read().expect("synonyms lock poisoned");
             expand_synonym_groups(&dict, query_tokens.clone())
         };
+        // spec index-rs-zero-hit-mining: per-TOKEN miss — the group's
+        // concept matched nothing across ALL queried fields
+        let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+        let mut miss_flags: Vec<bool> = vec![false; query_tokens.len()];
+        for g in &groups {
+            if !self.group_has_hits(&field_names, g) {
+                for idx in &g.tokens {
+                    if let Some(f) = miss_flags.get_mut(*idx) {
+                        *f = true;
+                    }
+                }
+            }
+        }
         let mut best: BTreeMap<usize, f64> = BTreeMap::new();
         for (name, fboost) in fields {
             // Per-field score: sum over matched groups (operator), with the
@@ -1657,16 +1729,16 @@ impl Engine {
                 }
             }
         }
-        // spec index-rs-zero-hit-mining W1: miss = this multi_match matched nothing
+        // spec index-rs-zero-hit-mining W1: per-token miss flags
+        self.record_query_tokens(&query_tokens, &miss_flags);
         let out: BTreeMap<usize, f64> = best.into_iter().map(|(k, v)| (k, v * boost)).collect();
-        self.record_query_tokens(&query_tokens, out.is_empty());
         Ok(out)
     }
 
     fn eval_text_match_with_msm(
         &self,
         field: &str,
-        groups: &[Vec<GroupMember>],
+        groups: &[SynonymGroup],
         operator: Operator,
         msm: &Option<Msm>,
     ) -> BTreeMap<usize, f64> {
@@ -1690,7 +1762,7 @@ impl Engine {
         for group in groups {
             // union over the group members (terms + phrases)
             let mut m: BTreeMap<usize, f64> = BTreeMap::new();
-            for member in group {
+            for member in &group.members {
                 let pairs = match member {
                     GroupMember::Term(t) => self.term_scores(tfield, t),
                     GroupMember::Phrase(toks) => self.phrase_scores(tfield, toks),
