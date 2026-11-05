@@ -553,6 +553,9 @@ pub async fn synonyms_list_handler(
             "id": r.id,
             "terms_a": r.terms_a,
             "terms_b": r.terms_b,
+            // spec admin-synonym-ui W2: expose the rule scope so the admin
+            // table can render a "globalna" badge for NULL category
+            "category": r.category,
         })).collect::<Vec<_>>()
     }))
     .into_response()
