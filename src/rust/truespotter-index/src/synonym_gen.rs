@@ -188,8 +188,10 @@ pub async fn run_mining_once(state: &Arc<AppState>, cfg: &MinerConfig) -> usize 
     };
     let mut candidates: Vec<String> = Vec::with_capacity(cfg.batch);
     let mut seen: HashSet<String> = HashSet::new();
-    for (t, count) in engine.query_terms(500) {
-        if count >= 5 && pass_filters(&t) && seen.insert(t.clone()) {
+    // zero-hit terms FIRST (miss desc — their queries return nothing:
+    // the catalog does not know the user's word), then frequency
+    for (t, count, _miss) in engine.query_terms(500) {
+        if count >= 3 && pass_filters(&t) && seen.insert(t.clone()) {
             candidates.push(t);
             if candidates.len() >= cfg.batch {
                 break;

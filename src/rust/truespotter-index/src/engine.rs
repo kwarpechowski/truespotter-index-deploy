@@ -605,10 +605,11 @@ pub struct Engine {
     /// Dynamic synonym dictionary (spec index-rs-dynamic-synonyms W3) —
     /// hot-swappable without a rebuild; expansion reads it per query.
     synonyms: std::sync::RwLock<SynonymDict>,
-    /// Query-term frequency counter (spec index-rs-query-mining W1) —
-    /// RAM only, per-boot; feeds the LLM synonym miner with the
-    /// vocabulary users actually type.
-    query_log: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Query-term counter (specs index-rs-query-mining +
+    /// index-rs-zero-hit-mining W1) — (count, miss) per term, RAM only,
+    /// per-boot; feeds the LLM synonym miner with the vocabulary users
+    /// actually type, miss-first (terms whose queries return nothing).
+    query_log: std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
     _tmp: Option<tempfile::TempDir>,
 }
 
@@ -928,17 +929,22 @@ impl Engine {
         *self.synonyms.write().expect("synonyms lock poisoned") = dict;
     }
 
-    /// Record query tokens into the frequency counter (spec
-    /// index-rs-query-mining W1) — called pre-expansion, once per
-    /// match/multi_match clause. Amortized cap: past 20k unique terms the
+    /// Record query tokens into the counter (spec index-rs-query-mining
+    /// W1 + index-rs-zero-hit-mining W1) — called once per
+    /// match/multi_match clause, with the clause-level miss flag (the
+    /// clause matched NOTHING). Amortized cap: past 20k unique terms the
     /// map prunes to the top 10k by count.
-    fn record_query_tokens(&self, tokens: &[String]) {
+    fn record_query_tokens(&self, tokens: &[String], miss: bool) {
         let mut log = self.query_log.lock().expect("query log lock poisoned");
         for t in tokens {
-            *log.entry(t.clone()).or_insert(0) += 1;
+            let e = log.entry(t.clone()).or_insert((0, 0));
+            e.0 += 1;
+            if miss {
+                e.1 += 1;
+            }
         }
         if log.len() > 20_000 {
-            let mut counts: Vec<(String, u64)> =
+            let mut counts: Vec<(String, (u64, u64))> =
                 log.iter().map(|(k, v)| (k.clone(), *v)).collect();
             counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
             counts.truncate(10_000);
@@ -946,12 +952,15 @@ impl Engine {
         }
     }
 
-    /// Top query-log terms by frequency (W2) — count desc, alpha tie-break.
-    pub fn query_terms(&self, limit: usize) -> Vec<(String, u64)> {
+    /// Top query-log terms (spec index-rs-zero-hit-mining W2) —
+    /// (term, count, miss), miss desc then count desc, alpha tie-break.
+    pub fn query_terms(&self, limit: usize) -> Vec<(String, u64, u64)> {
         let log = self.query_log.lock().expect("query log lock poisoned");
-        let mut out: Vec<(String, u64)> =
-            log.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut out: Vec<(String, u64, u64)> = log
+            .iter()
+            .map(|(k, (c, m))| (k.clone(), *c, *m))
+            .collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
         out.truncate(limit);
         out
     }
@@ -1408,8 +1417,9 @@ impl Engine {
         if tokens.is_empty() {
             return BTreeMap::new();
         }
-        // spec index-rs-query-mining W1: record the vocabulary users type
-        self.record_query_tokens(&tokens);
+        // spec index-rs-query-mining W1: record the vocabulary users type.
+        // Zero-hit flag needs the result — recorded after evaluation below.
+        let query_tokens_for_log = tokens.clone();
         // Spec index-rs-synonyms W2: non-fuzzy match queries expand each
         // token with its synonyms (group = original + synonyms, one map
         // per GROUP). Fuzzy stays literal — typo tolerance is orthogonal.
@@ -1505,6 +1515,8 @@ impl Engine {
                 }
             }
         }
+        // spec index-rs-zero-hit-mining W1: miss = this clause matched nothing
+        self.record_query_tokens(&query_tokens_for_log, out.is_empty());
         out
     }
 
@@ -1628,11 +1640,9 @@ impl Engine {
         // msm unit, so minimum_should_match keeps its per-original-token
         // semantics (W3).
         let query_tokens = folded_tokens(text);
-        // spec index-rs-query-mining W1: record the vocabulary users type
-        self.record_query_tokens(&query_tokens);
         let groups = {
             let dict = self.synonyms.read().expect("synonyms lock poisoned");
-            expand_synonym_groups(&dict, query_tokens)
+            expand_synonym_groups(&dict, query_tokens.clone())
         };
         let mut best: BTreeMap<usize, f64> = BTreeMap::new();
         for (name, fboost) in fields {
@@ -1647,7 +1657,10 @@ impl Engine {
                 }
             }
         }
-        Ok(best.into_iter().map(|(k, v)| (k, v * boost)).collect())
+        // spec index-rs-zero-hit-mining W1: miss = this multi_match matched nothing
+        let out: BTreeMap<usize, f64> = best.into_iter().map(|(k, v)| (k, v * boost)).collect();
+        self.record_query_tokens(&query_tokens, out.is_empty());
+        Ok(out)
     }
 
     fn eval_text_match_with_msm(

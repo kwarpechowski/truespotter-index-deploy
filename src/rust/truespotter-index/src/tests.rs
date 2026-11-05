@@ -959,16 +959,44 @@ fn query_log_counts_tokens_per_match() {
     search(&e, &json!({ "size": 1, "query": { "match": { "title": "telefon" } } }));
     let terms = e.query_terms(10);
     // every multi_match token counted 5x (stems: but, do, biegan)
-    assert_eq!(terms[0].1, 5, "{terms:?}");
-    let by_term: std::collections::HashMap<String, u64> = terms.into_iter().collect();
-    assert_eq!(by_term.get("but"), Some(&5), "{by_term:?}");
-    assert_eq!(by_term.get("biegan"), Some(&5), "{by_term:?}");
-    assert_eq!(by_term.get("telefon"), Some(&1), "{by_term:?}");
+    let by_term: std::collections::HashMap<String, (u64, u64)> =
+        terms.into_iter().map(|(t, c, m)| (t, (c, m))).collect();
+    assert_eq!(by_term.get("but"), Some(&(5, 0)), "{by_term:?}");
+    assert_eq!(by_term.get("biegan"), Some(&(5, 0)), "{by_term:?}");
+    assert_eq!(by_term.get("telefon"), Some(&(1, 0)), "{by_term:?}");
     // fuzzy match queries feed the counter too
     search(&e, &json!({ "size": 1, "query": { "match": { "title": { "query": "telefun", "fuzziness": "AUTO" } } } }));
-    let by_term: std::collections::HashMap<String, u64> =
-        e.query_terms(10).into_iter().collect();
-    assert_eq!(by_term.get("telefun"), Some(&1), "{by_term:?}");
+    let by_term: std::collections::HashMap<String, (u64, u64)> =
+        e.query_terms(10).into_iter().map(|(t, c, m)| (t, (c, m))).collect();
+    assert_eq!(by_term.get("telefun"), Some(&(1, 0)), "{by_term:?}");
+}
+
+/// Spec index-rs-zero-hit-mining (W1): a clause that matches NOTHING
+/// increments the miss counter for all its tokens — and miss-first
+/// ordering puts those terms at the top of the miner's candidate list.
+#[test]
+fn zero_hit_queries_increment_miss_counter() {
+    let docs = vec![
+        doc("buty", json!({ "title": "Buty do biegania" })),
+    ];
+    let e = Engine::build(docs, None).expect("build engine");
+    // 2 misses + 1 hit for "buty"-like queries
+    for _ in 0..2 {
+        search(&e, &json!({ "size": 1, "query": { "multi_match": { "query": "adidasy tanie", "fields": ["title"] } } }));
+    }
+    search(&e, &json!({ "size": 1, "query": { "match": { "title": "buty" } } }));
+    // one match-query miss
+    search(&e, &json!({ "size": 1, "query": { "match": { "title": "krakers" } } }));
+
+    let terms = e.query_terms(10);
+    // miss-first ordering: "adidas" (2 misses) and "krakers" (1 miss) on top
+    assert_eq!(terms[0].0, "adidas", "{terms:?}");
+    assert_eq!(terms[0].2, 2, "{terms:?}");
+    let by_term: std::collections::HashMap<String, (u64, u64)> =
+        terms.into_iter().map(|(t, c, m)| (t, (c, m))).collect();
+    assert_eq!(by_term.get("krakers"), Some(&(1, 1)), "{by_term:?}");
+    // hits never increment miss
+    assert_eq!(by_term.get("but"), Some(&(1, 0)), "{by_term:?}");
 }
 
 /// Spec index-rs-dynamic-synonyms (W7): raw (diacritic) rule words stem at

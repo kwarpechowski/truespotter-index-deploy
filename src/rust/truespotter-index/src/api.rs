@@ -582,10 +582,12 @@ pub async fn synonyms_candidates_handler(
     let terms = engine
         .query_terms(100)
         .into_iter()
-        .map(|(t, count)| {
+        .map(|(t, count, miss)| {
             json!({
                 "term": t,
                 "count": count,
+                "miss": miss,
+                "miss_ratio": if count > 0 { miss as f64 / count as f64 } else { 0.0 },
                 "covered": covered.contains(&t),
                 "mined": mined.contains(&t),
             })
