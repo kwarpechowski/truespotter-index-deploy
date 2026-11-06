@@ -260,6 +260,7 @@ impl SynonymDict {
         self.pairs.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
@@ -2208,6 +2209,93 @@ impl Engine {
 
     // -- the search ----------------------------------------------------------
 
+    /// Output-order comparator over docs for the sort specs, computed
+    /// INLINE on record fields (W1, spec index-rs-sort-elimination) — no
+    /// SortKey vectors, no String clones. Missing-value semantics mirror
+    /// cmp_keys exactly: missing_last sorts last in BOTH directions
+    /// (Lucene `_last`); descending flips value order only.
+    fn cmp_docnos(
+        &self,
+        records: &[DocRec],
+        a: usize,
+        b: usize,
+        sorts: &[SortSpec],
+        matched: &BTreeMap<usize, f64>,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let rec_a = &records[a];
+        let rec_b = &records[b];
+        for spec in sorts {
+            // (a_missing, b_missing, natural ordering of values)
+            let (am, bm, ord) = match spec.key.as_str() {
+                "_score" => {
+                    let sa = matched.get(&a).copied().unwrap_or(0.0);
+                    let sb = matched.get(&b).copied().unwrap_or(0.0);
+                    (false, false, sa.total_cmp(&sb))
+                }
+                "_doc" | "_seq_no" => (false, false, a.cmp(&b)),
+                "price" | "trust_score" | "trust_count" | "created_at" => {
+                    let va = Self::num_field(rec_a, &spec.key);
+                    let vb = Self::num_field(rec_b, &spec.key);
+                    match (va, vb) {
+                        (Some(x), Some(y)) => (false, false, x.total_cmp(&y)),
+                        (None, None) => (true, true, Ordering::Equal),
+                        (None, Some(_)) => (true, false, Ordering::Equal),
+                        (Some(_), None) => (false, true, Ordering::Equal),
+                    }
+                }
+                "available" => {
+                    let va = rec_a.available.map(|v| if v { 1.0f64 } else { 0.0 });
+                    let vb = rec_b.available.map(|v| if v { 1.0f64 } else { 0.0 });
+                    match (va, vb) {
+                        (Some(x), Some(y)) => (false, false, x.total_cmp(&y)),
+                        (None, None) => (true, true, Ordering::Equal),
+                        (None, Some(_)) => (true, false, Ordering::Equal),
+                        (Some(_), None) => (false, true, Ordering::Equal),
+                    }
+                }
+                "slug" | "slug.keyword" => (false, false, rec_a.slug.cmp(&rec_b.slug)),
+                "title" | "title.keyword" => (false, false, rec_a.title.cmp(&rec_b.title)),
+                other => {
+                    let sa = Self::str_field(rec_a, other);
+                    let sb = Self::str_field(rec_b, other);
+                    match (sa, sb) {
+                        (Some(x), Some(y)) => (false, false, x.cmp(y)),
+                        (None, None) => (true, true, Ordering::Equal),
+                        (None, Some(_)) => (true, false, Ordering::Equal),
+                        (Some(_), None) => (false, true, Ordering::Equal),
+                    }
+                }
+            };
+            let ord = match (am, bm) {
+                (true, true) => continue,
+                (true, false) => {
+                    if spec.missing_last {
+                        return Ordering::Greater;
+                    }
+                    return Ordering::Less;
+                }
+                (false, true) => {
+                    if spec.missing_last {
+                        return Ordering::Less;
+                    }
+                    return Ordering::Greater;
+                }
+                (false, false) => {
+                    if spec.order == Order::Asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                }
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
     pub fn search(&self, req: &SearchRequest) -> Result<SearchOutcome, String> {
         let start = Instant::now();
         // spec index-rs-category-scoped-synonyms W1: extract the category
@@ -2218,7 +2306,23 @@ impl Engine {
         let ctx = QueryCtx { categories };
         let matched = self.eval(&req.query, &ctx)?;
         let mut docnos: Vec<usize> = matched.keys().copied().collect();
-        let has_score_sort = req.sort.iter().any(|s| s.key == "_score");
+
+        // W2 (spec index-rs-sort-elimination): size=0 without a cursor is
+        // a count/aggs request — ordering work is entirely dead weight.
+        if req.size == 0 && req.search_after.is_none() {
+            let total = docnos.len();
+            let aggregations = if req.aggs.is_empty() {
+                None
+            } else {
+                Some(self.eval_aggs(&req.aggs, &docnos, &ctx)?)
+            };
+            return Ok(SearchOutcome {
+                total,
+                hits: Vec::new(),
+                aggregations,
+                took_ms: start.elapsed().as_millis() as u64,
+            });
+        }
 
         // Sort with explicit specs + implicit slug tie-break.
         let has_slug_sort = req
@@ -2232,6 +2336,28 @@ impl Engine {
                 order: Order::Asc,
                 missing_last: true,
             });
+        }
+
+        // W3 (spec index-rs-sort-elimination): FIRST PAGE (from=0, no
+        // cursor) — select the top `size` docs and sort only that slice,
+        // O(n + k log k) instead of a full O(n log n) pass. Same output
+        // as the full sort (selection + slice-sort = exact top-k).
+        if req.search_after.is_none() && req.from == 0 && req.size < docnos.len() {
+            let records = self.recs();
+            let page: Vec<usize> = {
+                let cmp = |a: &usize, b: &usize| {
+                    self.cmp_docnos(&records, *a, *b, &sorts, &matched)
+                };
+                docnos.select_nth_unstable_by(req.size, cmp);
+                let mut top: Vec<usize> = docnos[..req.size].to_vec();
+                top.sort_unstable_by(cmp);
+                top
+            };
+            drop(records);
+            let total = docnos.len();
+            return self
+                .render_outcome(req, page, total, matched, docnos, ctx, start)
+                .map(|(o, _)| o);
         }
         let mut keyed: Vec<(usize, Vec<SortKey>)> = {
             let records = self.recs();
@@ -2281,6 +2407,29 @@ impl Engine {
             .map(|(docno, _)| *docno)
             .collect();
 
+        // NOTE: docnos was drained into `keyed` above — the agg input
+        // must be a fresh copy of the matched set
+        let all: Vec<usize> = matched.keys().copied().collect();
+        self.render_outcome(req, page, total, matched, all, ctx, start)
+            .map(|(o, _)| o)
+    }
+
+    /// Shared tail of search(): hits for the sorted `page` + facets over
+    /// ALL matched docs + timing (spec index-rs-sort-elimination — the
+    /// W3 first-page fast path and the legacy cursor/from>0 path land
+    /// here with identical output).
+    #[allow(clippy::too_many_arguments)]
+    fn render_outcome(
+        &self,
+        req: &SearchRequest,
+        page: Vec<usize>,
+        total: usize,
+        matched: BTreeMap<usize, f64>,
+        all_docs: Vec<usize>,
+        ctx: QueryCtx,
+        start: Instant,
+    ) -> Result<(SearchOutcome, ()), String> {
+        let has_score_sort = req.sort.iter().any(|s| s.key == "_score");
         let mut hits = Vec::with_capacity(page.len());
         {
             let records = self.recs();
@@ -2318,16 +2467,18 @@ impl Engine {
         let aggregations = if req.aggs.is_empty() {
             None
         } else {
-            let all: Vec<usize> = keyed.iter().map(|(d, _)| *d).collect();
-            Some(self.eval_aggs(&req.aggs, &all, &ctx)?)
+            Some(self.eval_aggs(&req.aggs, &all_docs, &ctx)?)
         };
 
-        Ok(SearchOutcome {
-            total,
-            hits,
-            aggregations,
-            took_ms: start.elapsed().as_millis() as u64,
-        })
+        Ok((
+            SearchOutcome {
+                total,
+                hits,
+                aggregations,
+                took_ms: start.elapsed().as_millis() as u64,
+            },
+            (),
+        ))
     }
 
     /// cursor comparison used by search (keys precomputed per doc).
