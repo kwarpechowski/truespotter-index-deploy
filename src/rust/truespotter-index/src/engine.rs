@@ -424,6 +424,45 @@ impl TokenStream for TsTokenStream {
 }
 
 // ---------------------------------------------------------------------------
+// DocSet (spec index-rs-docset) — the matched-set representation returned by
+// eval. `All` is the match_all fast form (O(1) instead of an 81k-entry map);
+// maps are IMMUTABLE (Arc) — every operation builds a new set (functional),
+// which lets the compound-filter results be cached and shared per corpus
+// generation. Scores ride the map values; `All` scores every doc 1.0
+// (match_all semantics).
+// ---------------------------------------------------------------------------
+
+enum DocSet {
+    All,
+    Map(std::sync::Arc<BTreeMap<usize, f64>>),
+}
+
+impl DocSet {
+    fn map(m: BTreeMap<usize, f64>) -> Self {
+        DocSet::Map(std::sync::Arc::new(m))
+    }
+
+    fn is_all(&self) -> bool {
+        matches!(self, DocSet::All)
+    }
+
+    /// Score of a doc (All -> 1.0; missing -> 0.0).
+    fn score(&self, docno: usize) -> f64 {
+        match self {
+            DocSet::All => 1.0,
+            DocSet::Map(m) => m.get(&docno).copied().unwrap_or(0.0),
+        }
+    }
+
+    fn contains(&self, docno: usize) -> bool {
+        match self {
+            DocSet::All => true,
+            DocSet::Map(m) => m.contains_key(&docno),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Vector store — brute-force kNN over an int8-quantized matrix. Persisted
 // to /data/vectors.f32 and mmap'd read-only (RAM budget); in-RAM fallback
 // when /data is unavailable. Rows are L2-normalized (W2) + symmetrically
@@ -667,6 +706,16 @@ pub struct Engine {
     /// Dynamic synonym dictionary (spec index-rs-dynamic-synonyms W3) —
     /// hot-swappable without a rebuild; expansion reads it per query.
     synonyms: std::sync::RwLock<SynonymDict>,
+    /// Corpus generation (spec index-rs-docset W2) — bumped on every
+    /// upsert/delete; invalidates the compound-filter cache.
+    records_gen: std::sync::atomic::AtomicU64,
+    /// Live (non-deleted) doc count maintained at build/write — O(1) for
+    /// DocSet::All totals (spec index-rs-docset W3).
+    live_docs: std::sync::atomic::AtomicUsize,
+    /// Cached results of the exact .NET AvailableFilter / ApprovedFilter
+    /// compound shapes, per corpus generation (spec index-rs-docset W2).
+    filter_cache:
+        std::sync::RwLock<HashMap<u8, (u64, std::sync::Arc<BTreeMap<usize, f64>>)>>,
     /// Query-term counter (specs index-rs-query-mining +
     /// index-rs-zero-hit-mining W1) — (count, miss) per term, RAM only,
     /// per-boot; feeds the LLM synonym miner with the vocabulary users
@@ -714,6 +763,55 @@ fn clause_weight(q: &Query) -> f64 {
         | Query::MultiMatch { boost, .. } => *boost,
         _ => 1.0,
     }
+}
+
+/// Detect the EXACT .NET AvailableFilter / ApprovedFilter compound
+/// shapes (spec index-rs-docset W2) — the verbatim forms every public
+/// query carries: should=[term, bool{must_not:[exists]}], msm=1.
+fn compound_kind(b: &crate::dsn::BoolQuery) -> Option<u8> {
+    if b.must.is_empty()
+        && b.filter.is_empty()
+        && b.must_not.is_empty()
+        && b.should.len() == 2
+        && b.minimum_should_match
+            .as_ref()
+            .map(|m| m.required(2))
+            == Some(1)
+    {
+        let Query::Term {
+            field: term_field,
+            value: term_val,
+        } = &b.should[0]
+        else {
+            return None;
+        };
+        let Query::Bool(nb) = &b.should[1] else {
+            return None;
+        };
+        if nb.must.len() != 1
+            || !nb.filter.is_empty()
+            || !nb.should.is_empty()
+            || nb.must_not.len() != 1
+        {
+            return None;
+        }
+        let Query::Exists { field: ef } = &nb.must_not[0] else {
+            return None;
+        };
+        if term_field == "available"
+            && matches!(term_val, crate::dsn::TermValue::Bool(true))
+            && ef == "available"
+        {
+            return Some(0);
+        }
+        if term_field == "status.keyword"
+            && matches!(term_val, crate::dsn::TermValue::Str(s) if s == "approved")
+            && ef == "status"
+        {
+            return Some(1);
+        }
+    }
+    None
 }
 
 /// Min-max score normalization to [0,1] per clause (spec
@@ -997,6 +1095,7 @@ impl Engine {
             slug: slug_field,
             docno,
         };
+        let live = records.iter().filter(|r| !r.deleted).count();
         Ok(Engine {
             records: std::sync::RwLock::new(records),
             reader,
@@ -1007,6 +1106,9 @@ impl Engine {
             pending_vectors: std::sync::RwLock::new(HashMap::new()),
             synonyms: std::sync::RwLock::new(synonyms),
             query_log: std::sync::Mutex::new(BTreeMap::new()),
+            records_gen: std::sync::atomic::AtomicU64::new(0),
+            live_docs: std::sync::atomic::AtomicUsize::new(live),
+            filter_cache: std::sync::RwLock::new(HashMap::new()),
             _tmp: Some(tmp),
         })
     }
@@ -1024,6 +1126,51 @@ impl Engine {
             .read()
             .expect("pending lock poisoned")
             .len()
+    }
+
+    /// Materialize the matched docnos (All -> live docs).
+    fn docset_keys(&self, set: &DocSet) -> Vec<usize> {
+        match set {
+            DocSet::All => {
+                let records = self.recs();
+                (0..records.len())
+                    .filter(|i| !records[*i].deleted)
+                    .collect()
+            }
+            DocSet::Map(m) => m.keys().copied().collect(),
+        }
+    }
+
+    /// O(1) matched count (All -> live_docs counter).
+    fn docset_len(&self, set: &DocSet) -> usize {
+        match set {
+            DocSet::All => self.live_docs.load(std::sync::atomic::Ordering::Relaxed),
+            DocSet::Map(m) => m.len(),
+        }
+    }
+
+    /// (docno, score) pairs — All materialized at 1.0 (FunctionScore).
+    fn docset_iter(&self, set: &DocSet) -> Vec<(usize, f64)> {
+        match set {
+            DocSet::All => {
+                let records = self.recs();
+                records
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| !r.deleted)
+                    .map(|(i, _)| (i, 1.0))
+                    .collect()
+            }
+            DocSet::Map(m) => m.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+
+    /// Owned map form (hybrid normalization materializes All).
+    fn docset_to_map(&self, set: &DocSet) -> BTreeMap<usize, f64> {
+        match set {
+            DocSet::All => self.docset_iter(set).into_iter().collect(),
+            DocSet::Map(m) => m.as_ref().clone(),
+        }
     }
 
     /// Hot-swap the synonym dictionary (spec index-rs-dynamic-synonyms W4):
@@ -1240,18 +1387,12 @@ impl Engine {
 
     /// Evaluate a query → matching docno → score. Filter-position clauses
     /// get uniform scores (the caller ignores them).
-    fn eval(&self, q: &Query, ctx: &QueryCtx) -> Result<BTreeMap<usize, f64>, String> {
+    fn eval(&self, q: &Query, ctx: &QueryCtx) -> Result<DocSet, String> {
         match q {
-            Query::MatchAll => Ok({
-                let records = self.recs();
-                records
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, r)| !r.deleted)
-                    .map(|(i, _)| (i, 1.0))
-                    .collect()
-            }),
-            Query::Term { field, value } => Ok(self.eval_term(field, value)),
+            // W1 (spec index-rs-docset): O(1) — the All form carries
+            // match_all without materializing an 81k-entry map
+            Query::MatchAll => Ok(DocSet::All),
+            Query::Term { field, value } => Ok(DocSet::map(self.eval_term(field, value))),
             Query::Terms { field, values } => {
                 let mut out = BTreeMap::new();
                 for v in values {
@@ -1259,9 +1400,9 @@ impl Engine {
                         out.insert(*docno, 1.0);
                     }
                 }
-                Ok(out)
+                Ok(DocSet::map(out))
             }
-            Query::Prefix { field, value } => Ok({
+            Query::Prefix { field, value } => Ok(DocSet::map({
                 let records = self.recs();
                 records
                     .iter()
@@ -1272,8 +1413,8 @@ impl Engine {
                     })
                     .map(|(i, _)| (i, 1.0))
                     .collect()
-            }),
-            Query::Range { field, gte, lte } => Ok({
+            })),
+            Query::Range { field, gte, lte } => Ok(DocSet::map({
                 let records = self.recs();
                 records
                     .iter()
@@ -1287,17 +1428,42 @@ impl Engine {
                     })
                     .map(|(i, _)| (i, 1.0))
                     .collect()
-            }),
+            })),
             Query::Exists { field } => {
                 let records = self.recs();
-                Ok(records
+                Ok(DocSet::map(records
                     .iter()
                     .enumerate()
                     .filter(|(i, r)| !r.deleted && self.exists_field(r, *i, field))
                     .map(|(i, _)| (i, 1.0))
-                    .collect())
+                    .collect()))
             }
-            Query::Bool(b) => self.eval_bool(b, ctx),
+            Query::Bool(b) => {
+                // W2 (spec index-rs-docset): the exact .NET AvailableFilter /
+                // ApprovedFilter compound shapes ride EVERY public query —
+                // cache their result maps per corpus generation; a write
+                // bumps records_gen and the next query rebuilds.
+                if let Some(kind) = compound_kind(b) {
+                    let gen = self.records_gen.load(std::sync::atomic::Ordering::Relaxed);
+                    {
+                        let cache = self.filter_cache.read().expect("filter cache lock");
+                        if let Some((cg, m)) = cache.get(&kind) {
+                            if *cg == gen {
+                                return Ok(DocSet::Map(m.clone()));
+                            }
+                        }
+                    }
+                    let set = self.eval_bool(b, ctx)?;
+                    if let DocSet::Map(m) = &set {
+                        self.filter_cache
+                            .write()
+                            .expect("filter cache lock")
+                            .insert(kind, (gen, m.clone()));
+                    }
+                    return Ok(set);
+                }
+                self.eval_bool(b, ctx)
+            }
             Query::Match {
                 field,
                 text,
@@ -1305,8 +1471,8 @@ impl Engine {
                 prefix_length,
                 boost,
                 operator,
-            } => Ok(self
-                .eval_text_match(
+            } => Ok(DocSet::map(
+                self.eval_text_match(
                     field,
                     text,
                     fuzziness.is_some(),
@@ -1316,25 +1482,30 @@ impl Engine {
                 )
                 .into_iter()
                 .map(|(k, v)| (k, v * boost))
-                .collect()),
-            Query::MatchPhrase { field, text, boost } => Ok(self
-                .eval_phrase(field, text, false)
-                .into_iter()
-                .map(|(k, v)| (k, v * boost))
-                .collect()),
-            Query::MatchPhrasePrefix { field, text, boost } => Ok(self
-                .eval_phrase(field, text, true)
-                .into_iter()
-                .map(|(k, v)| (k, v * boost))
-                .collect()),
+                .collect(),
+            )),
+            Query::MatchPhrase { field, text, boost } => Ok(DocSet::map(
+                self.eval_phrase(field, text, false)
+                    .into_iter()
+                    .map(|(k, v)| (k, v * boost))
+                    .collect(),
+            )),
+            Query::MatchPhrasePrefix { field, text, boost } => Ok(DocSet::map(
+                self.eval_phrase(field, text, true)
+                    .into_iter()
+                    .map(|(k, v)| (k, v * boost))
+                    .collect(),
+            )),
             Query::MultiMatch {
                 text,
                 fields,
                 boost,
                 operator,
                 minimum_should_match,
-            } => self.eval_multi_match(text, fields, *boost, *operator, minimum_should_match, ctx),
-            Query::Knn { field, vector, k } => self.eval_knn(field, vector, *k),
+            } => self
+                .eval_multi_match(text, fields, *boost, *operator, minimum_should_match, ctx)
+                .map(DocSet::map),
+            Query::Knn { field, vector, k } => self.eval_knn(field, vector, *k).map(DocSet::map),
             Query::FunctionScore {
                 query,
                 script_score,
@@ -1344,7 +1515,7 @@ impl Engine {
                 let inner = self.eval(query, ctx)?;
                 let use_script = script_score.is_some();
                 let mut out = BTreeMap::new();
-                for (docno, score) in inner {
+                for (docno, score) in self.docset_iter(&inner) {
                     let mut s = score;
                     if use_script {
                         // The recognized trust script: trust_score * ln1p(trust_count)
@@ -1363,7 +1534,7 @@ impl Engine {
                     }
                     out.insert(docno, s);
                 }
-                Ok(out)
+                Ok(DocSet::map(out))
             }
         }
     }
@@ -1412,60 +1583,83 @@ impl Engine {
         &self,
         b: &crate::dsn::BoolQuery,
         ctx: &QueryCtx,
-    ) -> Result<BTreeMap<usize, f64>, String> {
-        // must: intersect, summing scores.
-        let mut must: Option<BTreeMap<usize, f64>> = None;
+    ) -> Result<DocSet, String> {
+        // W1 (spec index-rs-docset): must/filter fold over DocSet — All
+        // shortcuts skip the match_all map entirely (81k inserts saved on
+        // every public query); must intersections sum scores (All side
+        // contributes 1.0, match_all semantics).
+        let mut must: Option<DocSet> = None;
         for clause in &b.must {
             let r = self.eval(clause, ctx)?;
             must = Some(match must {
                 None => r,
-                Some(acc) => {
-                    let mut out = BTreeMap::new();
-                    for (doc, s) in acc {
-                        if let Some(s2) = r.get(&doc) {
-                            out.insert(doc, s + s2);
+                Some(acc) => match (&acc, &r) {
+                    (DocSet::All, DocSet::All) => DocSet::All,
+                    (DocSet::All, DocSet::Map(rm)) => DocSet::map(
+                        rm.iter().map(|(doc, s)| (*doc, s + 1.0)).collect(),
+                    ),
+                    (DocSet::Map(am), DocSet::All) => DocSet::map(
+                        am.iter().map(|(doc, s)| (*doc, s + 1.0)).collect(),
+                    ),
+                    (DocSet::Map(am), DocSet::Map(rm)) => {
+                        let mut out = BTreeMap::new();
+                        for (doc, s) in am.iter() {
+                            if let Some(s2) = rm.get(doc) {
+                                out.insert(*doc, s + s2);
+                            }
                         }
+                        DocSet::map(out)
                     }
-                    out
-                }
+                },
             });
         }
-        // filter: intersect as a set.
+        // filter: intersect as a set. All = no constraint (but still counts
+        // as "filter present" for the msm default below).
         let mut filter: Option<Vec<usize>> = None;
+        let mut filter_present = false;
         for clause in &b.filter {
             let r = self.eval(clause, ctx)?;
+            filter_present = true;
+            if r.is_all() {
+                continue;
+            }
+            let DocSet::Map(rm) = &r else {
+                continue;
+            };
             filter = Some(match filter {
-                None => r.keys().copied().collect(),
-                Some(acc) => acc.into_iter().filter(|d| r.contains_key(d)).collect(),
+                None => rm.keys().copied().collect(),
+                Some(acc) => acc.into_iter().filter(|d| rm.contains_key(d)).collect(),
             });
         }
         // base doc set = must ∩ filter (or whichever is present, else all).
         let mut base: Vec<usize> = match (&must, &filter) {
-            (Some(m), Some(f)) => {
+            (Some(DocSet::Map(m)), Some(f)) => {
                 let fset: std::collections::HashSet<usize> = f.iter().copied().collect();
                 m.keys().copied().filter(|d| fset.contains(d)).collect()
             }
-            (Some(m), None) => m.keys().copied().collect(),
+            (Some(DocSet::Map(m)), None) => m.keys().copied().collect(),
+            (Some(DocSet::All), Some(f)) => f.clone(),
+            (Some(DocSet::All), None) => self.docset_keys(&DocSet::All),
             (None, Some(f)) => f.clone(),
-            (None, None) => {
-                let records = self.recs();
-                (0..records.len())
-                    .filter(|i| !records[*i].deleted)
-                    .collect()
-            }
+            (None, None) => self.docset_keys(&DocSet::All),
         };
-        // must_not: subtract.
+        // must_not: subtract (an All must_not clears everything).
         for clause in &b.must_not {
             let r = self.eval(clause, ctx)?;
-            base.retain(|d| !r.contains_key(d));
-        }
-        // should: count matched clauses per doc, sum scores.
-        let should_maps: Vec<BTreeMap<usize, f64>> = {
-            let mut maps = Vec::new();
-            for clause in &b.should {
-                maps.push(self.eval(clause, ctx)?);
+            if r.is_all() {
+                base.clear();
+            } else {
+                let DocSet::Map(rm) = &r else { continue };
+                base.retain(|d| !rm.contains_key(d));
             }
-            maps
+        }
+        // should: per-clause DocSets (All scores 1.0 for every base doc).
+        let should_sets: Vec<DocSet> = {
+            let mut sets = Vec::new();
+            for clause in &b.should {
+                sets.push(self.eval(clause, ctx)?);
+            }
+            sets
         };
         // Spec index-rs-hybrid-normalization: when a should clause is kNN,
         // the bool is a "hybrid" query. Raw BM25 (unbounded) and kNN
@@ -1478,52 +1672,59 @@ impl Engine {
         let hybrid = b.should.iter().any(|c| matches!(c, Query::Knn { .. }));
         let weights: Vec<f64> = b.should.iter().map(clause_weight).collect();
         let should_maps: Vec<BTreeMap<usize, f64>> = if hybrid {
-            should_maps.iter().map(min_max_normalize).collect()
+            should_sets
+                .iter()
+                .map(|s| min_max_normalize(&self.docset_to_map(s)))
+                .collect()
         } else {
-            should_maps
+            Vec::new()
         };
         let mut out = BTreeMap::new();
         if b.should.is_empty() {
             for doc in base {
                 let score = must
                     .as_ref()
-                    .and_then(|m| m.get(&doc))
-                    .copied()
+                    .map(|m| m.score(doc))
                     .unwrap_or(1.0);
                 out.insert(doc, score);
             }
-            return Ok(out);
+            return Ok(DocSet::map(out));
         }
         let required = b
             .minimum_should_match
             .as_ref()
             .map(|m| m.required(b.should.len()))
-            .unwrap_or(if must.is_some() || filter.is_some() {
+            .unwrap_or(if must.is_some() || filter_present {
                 0
             } else {
                 1
             });
         for doc in base {
             let mut matched = 0usize;
-            let mut score = must
-                .as_ref()
-                .and_then(|m| m.get(&doc))
-                .copied()
-                .unwrap_or(0.0);
-            for (ci, map) in should_maps.iter().enumerate() {
-                if let Some(s) = map.get(&doc) {
-                    matched += 1;
-                    score += if hybrid { weights[ci] * s } else { *s };
+            let mut score = must.as_ref().map(|m| m.score(doc)).unwrap_or(0.0);
+            if hybrid {
+                for (ci, map) in should_maps.iter().enumerate() {
+                    if let Some(s) = map.get(&doc) {
+                        matched += 1;
+                        score += weights[ci] * s;
+                    }
+                }
+            } else {
+                for clause in &should_sets {
+                    if clause.contains(doc) {
+                        matched += 1;
+                        score += clause.score(doc);
+                    }
                 }
             }
             if matched >= required {
-                if must.is_none() && filter.is_none() && score == 0.0 {
+                if must.is_none() && !filter_present && score == 0.0 {
                     score = 1.0;
                 }
                 out.insert(doc, score);
             }
         }
-        Ok(out)
+        Ok(DocSet::map(out))
     }
 
     // -- tantivy text evaluation ----------------------------------------------
@@ -2191,7 +2392,7 @@ impl Engine {
                 crate::dsn::Agg::Filter { filter, aggs } => {
                     let r = self.eval(filter, ctx)?;
                     let sub_docs: Vec<usize> =
-                        docs.iter().copied().filter(|d| r.contains_key(d)).collect();
+                        docs.iter().copied().filter(|d| r.contains(*d)).collect();
                     let mut body = Map::new();
                     body.insert("doc_count".into(), json!(sub_docs.len()));
                     let sub = self.eval_aggs(aggs, &sub_docs, ctx)?;
@@ -2220,7 +2421,7 @@ impl Engine {
         a: usize,
         b: usize,
         sorts: &[SortSpec],
-        matched: &BTreeMap<usize, f64>,
+        matched: &DocSet,
     ) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let rec_a = &records[a];
@@ -2229,8 +2430,8 @@ impl Engine {
             // (a_missing, b_missing, natural ordering of values)
             let (am, bm, ord) = match spec.key.as_str() {
                 "_score" => {
-                    let sa = matched.get(&a).copied().unwrap_or(0.0);
-                    let sb = matched.get(&b).copied().unwrap_or(0.0);
+                    let sa = matched.score(a);
+                    let sb = matched.score(b);
                     (false, false, sa.total_cmp(&sb))
                 }
                 "_doc" | "_seq_no" => (false, false, a.cmp(&b)),
@@ -2305,12 +2506,12 @@ impl Engine {
         collect_categories(&req.query, &mut categories);
         let ctx = QueryCtx { categories };
         let matched = self.eval(&req.query, &ctx)?;
-        let mut docnos: Vec<usize> = matched.keys().copied().collect();
+        let mut docnos: Vec<usize> = self.docset_keys(&matched);
 
         // W2 (spec index-rs-sort-elimination): size=0 without a cursor is
         // a count/aggs request — ordering work is entirely dead weight.
         if req.size == 0 && req.search_after.is_none() {
-            let total = docnos.len();
+            let total = self.docset_len(&matched);
             let aggregations = if req.aggs.is_empty() {
                 None
             } else {
@@ -2369,7 +2570,7 @@ impl Engine {
                         docno,
                         sorts
                             .iter()
-                            .map(|s| self.sort_key(rec, docno, s, matched[&docno]))
+                            .map(|s| self.sort_key(rec, docno, s, matched.score(docno)))
                             .collect(),
                     )
                 })
@@ -2409,7 +2610,7 @@ impl Engine {
 
         // NOTE: docnos was drained into `keyed` above — the agg input
         // must be a fresh copy of the matched set
-        let all: Vec<usize> = matched.keys().copied().collect();
+        let all: Vec<usize> = self.docset_keys(&matched);
         self.render_outcome(req, page, total, matched, all, ctx, start)
             .map(|(o, _)| o)
     }
@@ -2424,7 +2625,7 @@ impl Engine {
         req: &SearchRequest,
         page: Vec<usize>,
         total: usize,
-        matched: BTreeMap<usize, f64>,
+        matched: DocSet,
         all_docs: Vec<usize>,
         ctx: QueryCtx,
         start: Instant,
@@ -2435,7 +2636,7 @@ impl Engine {
             let records = self.recs();
             for docno in &page {
                 let rec = &records[*docno];
-                let score = matched[docno];
+                let score = matched.score(*docno);
                 let sort_vals: Vec<Value> = req
                     .sort
                     .iter()
@@ -2487,14 +2688,14 @@ impl Engine {
         docno: &usize,
         cursor: &[SortValue],
         sorts: &[SortSpec],
-        matched: &BTreeMap<usize, f64>,
+        matched: &DocSet,
     ) -> bool {
         let keys: Vec<SortKey> = {
             let records = self.recs();
             let rec = &records[*docno];
             sorts
                 .iter()
-                .map(|s| self.sort_key(rec, *docno, s, matched[docno]))
+                .map(|s| self.sort_key(rec, *docno, s, matched.score(*docno)))
                 .collect()
         };
         self.cursor_after(&keys, cursor, sorts)
@@ -2525,9 +2726,10 @@ impl Engine {
     /// selection set).
     pub fn select_slugs(&self, q: &crate::dsn::Query) -> Result<Vec<String>, String> {
         let matched = self.eval(q, &QueryCtx::global())?;
+        let matched = self.docset_keys(&matched);
         let records = self.recs();
         Ok(matched
-            .keys()
+            .iter()
             .filter(|d| !records[**d].deleted)
             .map(|d| records[*d].slug.clone())
             .collect())
@@ -2636,8 +2838,15 @@ impl Engine {
         }
         match slot {
             Some(i) => records[i] = rec,
-            None => records.push(rec),
+            None => {
+                records.push(rec);
+                self.live_docs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        // W2 (spec index-rs-docset): invalidate the compound-filter cache
+        self.records_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         existed
     }
 
@@ -2654,6 +2863,10 @@ impl Engine {
         let Some(slot) = records.iter().position(|r| !r.deleted && r.slug == slug) else {
             return false;
         };
+        self.live_docs
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.records_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         records[slot] = DocRec {
             slug: String::new(),
             title: String::new(),

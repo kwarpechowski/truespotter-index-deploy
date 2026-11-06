@@ -1028,6 +1028,49 @@ fn query_log_counts_tokens_per_match() {
     assert_eq!(by_term.get("telefun"), Some(&(1, 0)), "{by_term:?}");
 }
 
+/// Spec index-rs-docset (W1): the compound-filter cache invalidates on
+/// writes — a status upsert is visible to the NEXT filtered query
+/// (records_gen bump rebuilds the cached available/approved maps).
+#[test]
+fn compound_filter_cache_invalidates_on_write() {
+    let e = engine(); // corpus ships with status:"approved" on some docs
+    // warm the approved-compound cache
+    let res = search(
+        &e,
+        &json!({
+            "size": 50,
+            "query": { "bool": { "filter": [ approved_filter() ] } }
+        }),
+    );
+    let before = hit_slugs(&res);
+    assert!(!before.is_empty(), "corpus has approved docs");
+    // flip an approved doc to pending via upsert (no full rebuild — the
+    // cache must NOT keep serving the stale approved set)
+    let target = &before[0];
+    let mut doc = e.get_by_id(target).expect("doc");
+    doc["status"] = json!("pending");
+    e.upsert_doc(target, doc, None);
+    // query again — the doc must be gone from the approved view
+    let res = search(
+        &e,
+        &json!({ "size": 50, "query": { "bool": { "filter": [ approved_filter() ] } } }),
+    );
+    let after = hit_slugs(&res);
+    assert!(
+        !after.contains(target),
+        "stale cached approved set after upsert: {target} still present"
+    );
+    // and back: flip to approved — visible again
+    let mut doc = e.get_by_id(target).expect("doc");
+    doc["status"] = json!("approved");
+    e.upsert_doc(target, doc, None);
+    let res = search(
+        &e,
+        &json!({ "size": 50, "query": { "bool": { "filter": [ approved_filter() ] } } }),
+    );
+    assert!(hit_slugs(&res).contains(target), "re-approved doc must be back");
+}
+
 /// Spec index-rs-rebuild-churn (W3/W4): a deleted doc keeps its matrix
 /// row until compaction — kNN must never resurface the tombstone,
 /// regardless of when the (now gated) full rebuild happens.
