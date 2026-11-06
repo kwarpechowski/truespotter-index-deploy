@@ -15,6 +15,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres",
 chrono = { version = "0.4", features = ["serde"] }
 tantivy = "0.22"
 rayon = "1"
+zstd = "0.13"
 memmap2 = "0.9"
 regex = "1"
 tempfile = "3"

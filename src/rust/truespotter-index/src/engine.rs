@@ -43,7 +43,10 @@ pub struct EngineDoc {
 struct DocRec {
     slug: String,
     title: String,
-    raw: String,
+    /// zstd-compressed raw document JSON (spec index-rs-ram-zstd W1) —
+    /// catalog JSON compresses 6-12x, buying linear headroom for the
+    /// +34%/day corpus growth; decompressed on demand (hits/ad-hoc lookups)
+    raw_z: Vec<u8>,
     status: Option<String>,
     available: Option<bool>,
     price: Option<f64>,
@@ -841,8 +844,23 @@ fn min_max_normalize(m: &BTreeMap<usize, f64>) -> BTreeMap<usize, f64> {
 
 /// Ad-hoc field lookup against the raw doc JSON (write-path fields the
 /// .NET scans filter on that are not in the fast record set).
+/// Compress the raw document JSON once per write (spec
+/// index-rs-ram-zstd W1). Level 3 balances ratio and speed.
+fn compress_raw(s: &str) -> Vec<u8> {
+    zstd::encode_all(s.as_bytes(), 3).unwrap_or_default()
+}
+
+/// Decompress the stored raw document (W2). A corrupt frame degrades to
+/// an empty doc — never panics the query path.
+fn raw_str(rec: &DocRec) -> String {
+    zstd::decode_all(rec.raw_z.as_slice())
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "{}".to_string())
+}
+
 fn raw_value(rec: &DocRec, field: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(&rec.raw)
+    serde_json::from_str::<Value>(&raw_str(rec))
         .ok()
         .and_then(|v| v.get(field.trim_end_matches(".keyword")).cloned())
 }
@@ -866,7 +884,7 @@ fn extract_rec(slug: &str, doc: &Value) -> DocRec {
             .and_then(|t| t.as_str())
             .unwrap_or_default()
             .to_string(),
-        raw: doc.to_string(),
+        raw_z: compress_raw(&doc.to_string()),
         status: doc.get("status").and_then(|s| s.as_str()).map(String::from),
         available: doc.get("available").and_then(|a| a.as_bool()),
         price: get_f64(doc, "price"),
@@ -2646,7 +2664,7 @@ impl Engine {
                         SortKey::Missing => Value::Null,
                     })
                     .collect();
-                let mut source: Value = serde_json::from_str(&rec.raw).unwrap_or(Value::Null);
+                let mut source: Value = serde_json::from_str(&raw_str(rec)).unwrap_or(Value::Null);
                 if let Value::Object(o) = &mut source {
                     for ex in &req.source_excludes {
                         o.remove(ex);
@@ -2719,7 +2737,7 @@ impl Engine {
             .get(&i)
             .cloned()
             .or_else(|| self.vectors.row_vec(i));
-        Some((serde_json::from_str(&r.raw).unwrap_or(Value::Null), emb))
+        Some((serde_json::from_str(&raw_str(r)).unwrap_or(Value::Null), emb))
     }
 
     /// Slugs matching a query (the _update_by_query/_delete_by_query
@@ -2870,7 +2888,7 @@ impl Engine {
         records[slot] = DocRec {
             slug: String::new(),
             title: String::new(),
-            raw: "{}".into(),
+            raw_z: compress_raw("{}"),
             status: None,
             available: None,
             price: None,
