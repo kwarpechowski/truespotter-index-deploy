@@ -1530,6 +1530,7 @@ async fn unknown_clause_returns_400_shaped_error_via_api() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        search_cache: crate::query_cache::SearchCache::new(),
         ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
@@ -1589,6 +1590,7 @@ async fn health_reports_ready_flag() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        search_cache: crate::query_cache::SearchCache::new(),
         ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
@@ -1651,6 +1653,7 @@ async fn count_and_doc_endpoints() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        search_cache: crate::query_cache::SearchCache::new(),
         ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
@@ -2033,6 +2036,7 @@ async fn refresh_mapping_mget_and_scroll_endpoints() {
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        search_cache: crate::query_cache::SearchCache::new(),
         ready: std::sync::atomic::AtomicBool::new(false),
     });
     let app = Router::new()
@@ -2268,4 +2272,550 @@ fn chat_bridge_append_offer_literal_stays_in_pattern_catalog() {
     let pattern = crate::write::match_pattern(&crate::dsn::normalize_ws(literal))
         .expect("the chat-side SCRIPT_APPEND_OFFER copy must stay in the pattern catalog");
     assert_eq!(pattern, crate::write::Pattern::AppendOffer);
+}
+
+// ---------------------------------------------------------------------------
+// Perf task 1 (hot-query cache) + task 3 (slug map) — 2026-11-13.
+// Cache internals (gen-keyed invalidation, FIFO cap) are unit-tested in
+// query_cache.rs; here: the API-level X-Cache lifecycle, scroll bypass,
+// no-cache header bypass, gen-bump invalidation through the router, and
+// the slug map hit/miss/replace/delete behavior.
+// ---------------------------------------------------------------------------
+
+fn test_state(e: Engine) -> Arc<AppState> {
+    Arc::new(AppState {
+        engine: tokio::sync::RwLock::new(Arc::new(e)),
+        pool: None,
+        rebuild_secret: None,
+        write_lock: tokio::sync::Mutex::new(()),
+        scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        search_cache: crate::query_cache::SearchCache::new(),
+        vectors_dirty: std::sync::atomic::AtomicBool::new(false),
+        ready: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+async fn body_of(resp: axum::response::Response) -> Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_cache_hits_then_invalidates_on_write() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    let state = test_state(engine());
+    let app = Router::new()
+        .route("/:index/_search", post(crate::api::search_handler))
+        .with_state(state.clone());
+
+    let body = r#"{"query":{"term":{"slug.keyword":"asics-sonicblast"}}}"#;
+    // first search: MISS, populates the cache
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("x-cache").unwrap(),
+        "MISS",
+        "first identical query must be a cache MISS"
+    );
+    let first = body_of(resp).await;
+    assert_eq!(first["hits"]["total"]["value"], 1);
+
+    // second identical search: HIT with the same response bytes
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("x-cache").unwrap(),
+        "HIT",
+        "identical body on the same engine + records_gen must be a HIT"
+    );
+    assert_eq!(body_of(resp).await, first);
+
+    // a write bumps records_gen -> MISS again. The HTTP write path needs a
+    // Postgres pool (persist_upsert 503s without one), so bump the engine
+    // directly the same way index_doc's engine.upsert_doc does.
+    state
+        .engine
+        .read()
+        .await
+        .upsert_doc("asics-sonicblast", json!({
+            "slug": "asics-sonicblast", "title": "ASICS Sonicblast v2",
+            "type": "Buty do biegania", "price": 450.0, "currency": "PLN"
+        }), None);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("x-cache").unwrap(),
+        "MISS",
+        "records_gen bumped by the upsert must invalidate the entry"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn search_cache_skips_scroll_and_no_cache_header() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    let state = test_state(engine());
+    let app = Router::new()
+        .route("/:index/_search", post(crate::api::search_handler))
+        .with_state(state.clone());
+
+    // scroll request — never cached (no X-Cache header at all)
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/products/_search?scroll=1m")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"size": 2}"#.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("x-cache").is_none(),
+            "scroll responses must bypass the cache entirely"
+        );
+        let v = body_of(resp).await;
+        assert!(v.get("_scroll_id").is_some());
+    }
+    assert!(
+        state.search_cache.is_empty(),
+        "scroll requests must not populate the cache"
+    );
+
+    // Cache-Control: no-cache — served but never stored
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/products/_search")
+                    .header("content-type", "application/json")
+                    .header("cache-control", "no-cache")
+                    .body(Body::from(r#"{"size": 0}"#.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("x-cache").is_none(),
+            "no-cache requests must bypass the cache entirely"
+        );
+    }
+    assert!(
+        state.search_cache.is_empty(),
+        "no-cache requests must not populate the cache"
+    );
+
+    // plain request twice: MISS then HIT
+    let req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/products/_search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"size": 0}"#.to_string()))
+            .unwrap()
+    };
+    let resp = app.clone().oneshot(req()).await.unwrap();
+    assert_eq!(resp.headers().get("x-cache").unwrap(), "MISS");
+    let resp = app.clone().oneshot(req()).await.unwrap();
+    assert_eq!(resp.headers().get("x-cache").unwrap(), "HIT");
+}
+
+#[test]
+fn slug_map_hit_miss_replace_and_delete() {
+    let e = engine();
+
+    // hit: O(1) map path returns exactly what the scan used to
+    let res = search(
+        &e,
+        &json!({
+            "query": { "bool": { "must": [{ "term": { "slug.keyword": "asics-sonicblast" } }] } }
+        }),
+    );
+    assert_eq!(res["hits"]["total"]["value"], 1);
+    assert_eq!(res.pointer("/hits/hits/0/_id").unwrap(), "asics-sonicblast");
+
+    // miss: unknown slug -> 0 hits, no scan fallback surprises
+    let res = search(
+        &e,
+        &json!({
+            "query": { "bool": { "must": [{ "term": { "slug.keyword": "does-not-exist" } }] } }
+        }),
+    );
+    assert_eq!(res["hits"]["total"]["value"], 0);
+
+    // terms (multi-slug) rides the same fast path
+    let res = search(
+        &e,
+        &json!({
+            "query": { "bool": { "must": [
+                { "terms": { "slug.keyword": ["asics-sonicblast", "lumina-tv-4k", "nope"] } }
+            ] } }
+        }),
+    );
+    assert_eq!(res["hits"]["total"]["value"], 2);
+
+    // get_doc / get_by_id via the map
+    assert!(e.get_by_id("nike-air-max").is_some());
+    assert!(e.get_by_id("nope").is_none());
+
+    // re-upsert with the same slug: map entry replaced, docno stable,
+    // get_doc returns the NEW source
+    let existed = e.upsert_doc(
+        "nike-air-max",
+        json!({
+            "slug": "nike-air-max", "title": "Nike Air Max v2",
+            "type": "Buty sportowe", "price": 333.0, "currency": "PLN"
+        }),
+        None,
+    );
+    assert!(existed, "re-upsert of a live slug reports existed");
+    let src = e.get_by_id("nike-air-max").unwrap();
+    assert_eq!(src["title"], "Nike Air Max v2");
+    let res = search(
+        &e,
+        &json!({
+            "query": { "bool": { "must": [{ "term": { "slug.keyword": "nike-air-max" } }] } }
+        }),
+    );
+    assert_eq!(res["hits"]["total"]["value"], 1);
+
+    // upsert of a NEW slug lands in the map (fresh insert path)
+    e.upsert_doc(
+        "brand-new-slug",
+        json!({
+            "slug": "brand-new-slug", "title": "Brand New",
+            "type": "Inne", "price": 1.0, "currency": "PLN"
+        }),
+        None,
+    );
+    assert!(e.get_by_id("brand-new-slug").is_some());
+
+    // delete removes the entry: term miss, get miss, second delete false
+    assert!(e.delete_doc("brand-new-slug"));
+    assert!(!e.delete_doc("brand-new-slug"), "second delete is a no-op");
+    assert!(e.get_by_id("brand-new-slug").is_none());
+    let res = search(
+        &e,
+        &json!({
+            "query": { "bool": { "must": [{ "term": { "slug.keyword": "brand-new-slug" } }] } }
+        }),
+    );
+    assert_eq!(res["hits"]["total"]["value"], 0);
+
+    // delete of a never-present slug: no-op, map intact
+    assert!(!e.delete_doc("never-existed"));
+    assert!(e.get_by_id("asics-sonicblast").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Streaming build (spec index-rs-scale-100x Phase 1 — R2/R5 tests)
+// ---------------------------------------------------------------------------
+
+use crate::engine::{heap_budget_bytes, rss_mb, SynonymDict};
+use std::path::PathBuf;
+
+fn chunked(docs: Vec<EngineDoc>, size: usize) -> Vec<Vec<EngineDoc>> {
+    let mut out = Vec::new();
+    let mut it = docs.into_iter().peekable();
+    while it.peek().is_some() {
+        out.push(it.by_ref().take(size).collect());
+    }
+    out
+}
+
+/// The corpus plus the streaming edge cases the plain corpus() misses:
+/// a leading None row BEFORE the first embedding (row 0 = deferred zero
+/// row), a mismatched-dim embedding (zero row) and a trailing None.
+fn streaming_corpus_docs() -> Vec<EngineDoc> {
+    let mut docs = corpus();
+    docs[0].embedding = None; // leading None — before the first embedding
+    // mismatched-dim row (dim 2 ≠ 4 → zero row) placed AFTER the first
+    // dim-4 embedding so the store width stays 4 in both build paths
+    docs.insert(
+        2,
+        doc(
+            "mismatched-dim-doc",
+            json!({ "title": "Mismatched Dim", "type": "Inne", "price": 1.0 }),
+        ),
+    );
+    docs[2].embedding = Some(vec![1.0, 2.0]); // dim 2 ≠ 4 → zero row
+    docs.push(doc(
+        "trailing-none-doc",
+        json!({ "title": "Trailing None", "type": "Inne", "price": 2.0 }),
+    ));
+    docs
+}
+
+#[test]
+fn streaming_build_identical_matrix_bytes_and_search_results() {
+    let docs = streaming_corpus_docs();
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let vec_engine = Engine::build(streaming_corpus_docs(), Some(PathBuf::from(dir_a.path())))
+        .expect("vec build");
+    let streaming_engine = Engine::build_streaming(
+        Some(PathBuf::from(dir_b.path())),
+        SynonymDict::empty(),
+        heap_budget_bytes(),
+        chunked(docs, 5),
+    )
+    .expect("streaming build");
+    // the critical equivalence proof: byte-identical v3 matrix
+    let bytes_a = std::fs::read(dir_a.path().join("vectors.f32")).unwrap();
+    let bytes_b = std::fs::read(dir_b.path().join("vectors.f32")).unwrap();
+    assert!(!bytes_a.is_empty(), "matrix written");
+    assert_eq!(bytes_a, bytes_b, "streaming matrix must be byte-identical");
+    // and identical search results across query shapes
+    for body in [
+        json!({ "query": { "match": { "title": "buty" } }, "size": 10 }),
+        json!({ "query": { "bool": { "filter": [
+            { "term": { "status.keyword": "approved" } },
+            { "term": { "available": true } }
+        ] } }, "size": 10 }),
+        json!({
+            "query": { "bool": { "must": [ { "knn": { "embedding": { "vector": [1.0, 0.0, 0.0, 0.0], "k": 3 } } } ] } },
+            "size": 3
+        }),
+        json!({ "query": { "match_all": {} }, "size": 50,
+                "aggs": { "cats": { "terms": { "field": "type.keyword", "size": 5 } } } }),
+    ] {
+        let mut a = search(&vec_engine, &body);
+        let mut b = search(&streaming_engine, &body);
+        // `took` is wall-clock timing noise — everything else must match
+        a.as_object_mut().unwrap().remove("took");
+        b.as_object_mut().unwrap().remove("took");
+        assert_eq!(a, b, "results must match for body {body}");
+    }
+}
+
+#[test]
+fn streaming_build_edge_case_empty_first_embedding_is_empty_store() {
+    // mirrors VectorStore::build: an empty vec as the FIRST embedding →
+    // dim 0 → the whole store is Empty (identical in both build paths)
+    let empty_first_corpus = |mut docs: Vec<EngineDoc>| {
+        docs.insert(
+            0,
+            doc(
+                "empty-emb-doc",
+                json!({ "title": "Empty Emb", "type": "Inne", "price": 3.0 }),
+            ),
+        );
+        docs[0].embedding = Some(vec![]);
+        docs
+    };
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let vec_engine =
+        Engine::build(empty_first_corpus(corpus()), Some(PathBuf::from(dir_a.path()))).unwrap();
+    let streaming_engine = Engine::build_streaming(
+        Some(PathBuf::from(dir_b.path())),
+        SynonymDict::empty(),
+        heap_budget_bytes(),
+        chunked(empty_first_corpus(corpus()), 2),
+    )
+    .unwrap();
+    // neither path wrote a matrix (Empty store)
+    assert!(!dir_a.path().join("vectors.f32").exists());
+    assert!(!dir_b.path().join("vectors.f32").exists());
+    let body = json!({ "query": { "match": { "title": "buty" } }, "size": 10 });
+    let mut a = search(&vec_engine, &body);
+    let mut b = search(&streaming_engine, &body);
+    a.as_object_mut().unwrap().remove("took");
+    b.as_object_mut().unwrap().remove("took");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn streaming_build_ram_fallback_without_data_dir_matches_vec_build() {
+    let docs = streaming_corpus_docs();
+    let vec_engine = Engine::build(streaming_corpus_docs(), None).unwrap();
+    let streaming_engine = Engine::build_streaming(
+        None,
+        SynonymDict::empty(),
+        heap_budget_bytes(),
+        std::iter::once(docs),
+    )
+    .unwrap();
+    let body = json!({
+        "query": { "bool": { "must": [ { "knn": { "embedding": { "vector": [0.9, 0.1, 0.0, 0.0], "k": 3 } } } ] } },
+        "size": 3
+    });
+    let mut a = search(&vec_engine, &body);
+    let mut b = search(&streaming_engine, &body);
+    a.as_object_mut().unwrap().remove("took");
+    b.as_object_mut().unwrap().remove("took");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn streaming_build_staging_files_cleaned_up_after_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let docs = streaming_corpus_docs();
+    let _engine = Engine::build_streaming(
+        Some(PathBuf::from(dir.path())),
+        SynonymDict::empty(),
+        heap_budget_bytes(),
+        chunked(docs, 3),
+    )
+    .expect("streaming build");
+    // atomic rename landed the final matrix; no staging/temp leftovers
+    assert!(dir.path().join("vectors.f32").exists());
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("vectors.f32.new") || n.starts_with(".vectors-matrix-"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+}
+
+#[test]
+fn keyset_page_seam_drains_whole_corpus_in_order() {
+    use crate::store::keyset_page;
+    let mut docs: Vec<EngineDoc> = (0..10)
+        .map(|i| doc(&format!("slug-{i:02}"), json!({ "n": i })))
+        .collect();
+    docs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    // full drain loop exactly like stream_pages runs it
+    let mut seen: Vec<String> = Vec::new();
+    let mut last: Option<String> = None;
+    let mut batches = 0usize;
+    loop {
+        let page = keyset_page(&docs, last.as_deref(), 3);
+        if page.is_empty() {
+            break;
+        }
+        batches += 1;
+        assert!(
+            page.windows(2).all(|w| w[0].slug < w[1].slug),
+            "page must be slug-ascending"
+        );
+        seen.extend(page.iter().map(|d| d.slug.clone()));
+        last = Some(page.last().unwrap().slug.clone());
+    }
+    assert_eq!(batches, 4, "10 docs / page 3 → 3 full pages + 1 partial");
+    let mut expected: Vec<String> = (0..10).map(|i| format!("slug-{i:02}")).collect();
+    expected.sort();
+    assert_eq!(seen, expected, "every doc exactly once, slug order");
+
+    // exact multiple of the page size: no phantom extra round trip content
+    let nine: Vec<EngineDoc> = (0..9)
+        .map(|i| doc(&format!("a-{i:02}"), json!({})))
+        .collect();
+    let p1 = keyset_page(&nine, None, 3);
+    let p2 = keyset_page(&nine, Some(&p1.last().unwrap().slug), 3);
+    let p3 = keyset_page(&nine, Some(&p2.last().unwrap().slug), 3);
+    let p4 = keyset_page(&nine, Some(&p3.last().unwrap().slug), 3);
+    assert!(p4.is_empty(), "9 docs = exactly 3 pages");
+    assert_eq!(p1.len() + p2.len() + p3.len(), 9);
+
+    // empty corpus → immediately empty page
+    assert!(keyset_page(&[], None, 3).is_empty());
+    // limit larger than the corpus → one page
+    assert_eq!(keyset_page(&nine, None, 100).len(), 9);
+}
+
+/// Spec R5 (RSS-flatness). RSS is inherently flaky in unit-test processes
+/// (allocator behavior, mmap warm-start, parallel test siblings), so this
+/// runs only when explicitly requested on Linux:
+/// `cargo test -- --ignored streaming_build_rss_flatness`.
+/// The STRUCTURAL guarantee (no corpus materialization: batches are moved
+/// into the builder and dropped per ingest — nothing accumulates but the
+/// engine's own compressed record set) is enforced by design: the builder
+/// API takes batches, `keyset_page_seam_drains_whole_corpus_in_order`
+/// pins the feeding loop, and the matrix staging file keeps quantized rows
+/// off the heap.
+#[test]
+#[ignore = "RSS measurement is flaky next to parallel tests — run manually on Linux (spec R5)"]
+fn streaming_build_rss_flatness() {
+    if rss_mb().is_none() {
+        eprintln!("skipping: /proc/self/statm unavailable (non-Linux)");
+        return;
+    }
+    let build = |n: usize| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = crate::engine::Engine::streaming_build(
+            Some(PathBuf::from(dir.path())),
+            SynonymDict::empty(),
+            heap_budget_bytes(),
+        )
+        .unwrap();
+        let mut batch: Vec<EngineDoc> = Vec::with_capacity(500);
+        for i in 0..n {
+            // ~2 KB of text per doc, as the spec's synthetic corpus asks
+            let text = "lorem ipsum dolor sit amet ".repeat(80);
+            batch.push(doc(
+                &format!("rss-doc-{i:07}"),
+                json!({ "title": format!("Doc {i} {text}") }),
+            ));
+            if batch.len() == 500 {
+                b.add_batch(std::mem::take(&mut batch)).unwrap();
+            }
+        }
+        if !batch.is_empty() {
+            b.add_batch(batch).unwrap();
+        }
+        b.finish().unwrap()
+    };
+    let before = rss_mb().unwrap();
+    build(10_000);
+    let after_10k = rss_mb().unwrap();
+    build(50_000);
+    let after_50k = rss_mb().unwrap();
+    // 5x the docs: RSS may grow by the engine's own record set
+    // (zstd-compressed, ~hundreds of B/doc) — but NOT by the raw 2KB/doc
+    // corpus, tantivy heap growth or a second full-corpus Vec.
+    let growth = after_50k - after_10k;
+    eprintln!(
+        "rss before={before:.0}MB after10k={after_10k:.0}MB after50k={after_50k:.0}MB growth={growth:.0}MB"
+    );
+    assert!(
+        growth < 500.0,
+        "RSS grew {growth:.0} MB from 10k→50k docs (~2KB each): expected flat-ish (records only)"
+    );
 }

@@ -19,6 +19,7 @@
 mod api;
 mod dsn;
 mod engine;
+mod query_cache;
 mod store;
 mod synonym_gen;
 mod write;
@@ -152,16 +153,55 @@ async fn main() {
     .await;
 }
 
-/// `--rebuild` standalone mode: load → build → report.
+/// `--rebuild` standalone mode: stream → build → report.
 async fn engine_rebuild_standalone(pool: &sqlx::PgPool) -> Result<usize, String> {
-    let docs = store::load_all(pool).await?;
-    let n = docs.len();
     let data_dir = std::env::var("DATA_DIR").map(std::path::PathBuf::from).ok();
     let synonyms = store::load_synonym_dict(pool).await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "synonym dict load failed — building without");
         engine::SynonymDict::empty()
     });
-    engine::Engine::build_with_synonyms(docs, data_dir, synonyms).map(|_| n)
+    let (_engine, n) = build_engine_streaming(pool, data_dir, synonyms).await?;
+    Ok(n)
+}
+
+/// Memory-flat engine build from Postgres (spec index-rs-scale-100x
+/// R2/R3): keyset pages flow through a BOUNDED channel into a blocking
+/// builder task — backpressure caps in-flight batches, so peak RSS is
+/// O(tantivy heap + batch) regardless of corpus size. Both sides of the
+/// pipeline surface their errors; a failed DB read aborts the build even
+/// if the builder finished on the partial corpus (the engine is discarded).
+pub(crate) async fn build_engine_streaming(
+    pool: &sqlx::PgPool,
+    data_dir: Option<std::path::PathBuf>,
+    synonyms: engine::SynonymDict,
+) -> Result<(engine::Engine, usize), String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<engine::EngineDoc>>(2);
+    let dd = data_dir.clone();
+    let build = tokio::task::spawn_blocking(move || {
+        let mut b = engine::Engine::streaming_build(dd, synonyms, engine::heap_budget_bytes())?;
+        while let Some(batch) = rx.blocking_recv() {
+            b.add_batch(batch)?;
+        }
+        b.finish()
+    });
+    // Feed keyset pages into the channel. A send error means the builder
+    // already failed — stop early and report the builder's error.
+    let fed = store::stream_pages(pool, |page| async {
+        if tx.send(page).await.is_err() {
+            Err("streaming build stopped mid-feed (builder failed)".to_string())
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    match build.await {
+        Ok(Ok(built)) => match fed {
+            Ok(n) => Ok((built, n)),
+            Err(e) => Err(e), // DB read failed — discard the partial build
+        },
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("streaming build join failure: {e}")),
+    }
 }
 
 /// Background-backfill options (serve mode with `--backfill`).
@@ -173,12 +213,12 @@ struct BackfillOpts {
     force: bool,
 }
 
-/// Serve-first boot task: (1) load all PG docs → build the embedded index
-/// (BM25 + vector matrix) → atomically swap into the serving engine and
-/// flip `ready`; (2) optionally run the OpenSearch backfill in the
-/// background. Neither phase may crash the server — a failed load leaves
-/// the empty index serving (ready=false), a failed backfill leaves the
-/// partial upserts in place (backfill is resumable — upserts).
+/// Serve-first boot task: (1) STREAM the PG docs into a memory-flat build
+/// (spec index-rs-scale-100x R2/R3) → atomically swap into the serving
+/// engine and flip `ready`; (2) optionally run the OpenSearch backfill in
+/// the background. Neither phase may crash the server — a failed load
+/// leaves the empty index serving (ready=false), a failed backfill leaves
+/// the partial upserts in place (backfill is resumable — upserts).
 fn spawn_boot_builder(
     state: Arc<api::AppState>,
     pool: sqlx::PgPool,
@@ -186,29 +226,13 @@ fn spawn_boot_builder(
     backfill: Option<BackfillOpts>,
 ) {
     tokio::spawn(async move {
-        // phase 1 — initial index build from Postgres
-        let docs = match store::load_all(&pool).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "initial index load failed — serving empty index, /health stays ready=false"
-                );
-                return;
-            }
-        };
-        let n = docs.len();
-        let dd = data_dir.clone();
+        // phase 1 — initial index build from Postgres (streaming)
         let synonyms = store::load_synonym_dict(&pool).await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "synonym dict load failed — building without");
             engine::SynonymDict::empty()
         });
-        match tokio::task::spawn_blocking(move || {
-            engine::Engine::build_with_synonyms(docs, Some(dd), synonyms)
-        })
-        .await
-        {
-            Ok(Ok(built)) => {
+        match build_engine_streaming(&pool, Some(data_dir), synonyms).await {
+            Ok((built, n)) => {
                 *state.engine.write().await = Arc::new(built);
                 state
                     .ready
@@ -220,17 +244,10 @@ fn spawn_boot_builder(
                 }
                 tracing::info!(docs = n, "initial index build complete (ready)");
             }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    error = %e,
-                    "initial index build failed — serving empty index, /health stays ready=false"
-                );
-                return;
-            }
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "initial index build join failure — serving empty index, /health stays ready=false"
+                    "initial index build failed — serving empty index, /health stays ready=false"
                 );
                 return;
             }
@@ -309,6 +326,7 @@ async fn serve(config: Config, backfill: bool, force: bool) {
         rebuild_secret: config.rebuild_secret.clone(),
         write_lock: tokio::sync::Mutex::new(()),
         scrolls: std::sync::Mutex::new(std::collections::HashMap::new()),
+        search_cache: query_cache::SearchCache::new(),
         vectors_dirty: std::sync::atomic::AtomicBool::new(false),
         ready: std::sync::atomic::AtomicBool::new(false),
     });
@@ -461,46 +479,29 @@ fn spawn_vector_rebuilder(state: Arc<api::AppState>, data_dir: std::path::PathBu
             let Some(pool) = state.pool.clone() else {
                 continue;
             };
-            let docs = match store::load_all(&pool).await {
-                Ok(d) => d,
+            // streaming build (spec index-rs-scale-100x R3) — compaction
+            // no longer materializes the corpus
+            let synonyms = store::load_synonym_dict(&pool).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "synonym dict load failed — building without");
+                engine::SynonymDict::empty()
+            });
+            let built = match build_engine_streaming(&pool, Some(data_dir.clone()), synonyms)
+                .await
+            {
+                Ok((e, n)) => {
+                    tracing::info!(docs = n, "vector-matrix rebuild complete");
+                    e
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "vector rebuild load failed");
+                    tracing::warn!(error = %e, "vector rebuild failed");
                     state
                         .vectors_dirty
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
             };
-            let n = docs.len();
-            let dd = data_dir.clone();
-            let synonyms = store::load_synonym_dict(&pool).await.unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "synonym dict load failed — building without");
-                engine::SynonymDict::empty()
-            });
-            let built = match tokio::task::spawn_blocking(move || {
-                engine::Engine::build_with_synonyms(docs, Some(dd), synonyms)
-            })
-            .await
-            {
-                    Ok(Ok(e)) => e,
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "vector rebuild failed");
-                        state
-                            .vectors_dirty
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "vector rebuild join failed");
-                        state
-                            .vectors_dirty
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                };
             *state.engine.write().await = Arc::new(built);
             last_rebuild = std::time::Instant::now();
-            tracing::info!(docs = n, "vector-matrix rebuild complete");
         }
     });
 }

@@ -15,6 +15,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -29,6 +30,32 @@ use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 use tantivy::{DocAddress, Index, IndexReader, ReloadPolicy, Term};
 
 use crate::dsn::{Msm, Operator, Order, Query, SearchRequest, SortSpec, SortValue};
+
+/// Dedicated rayon pool for the brute-force kNN matrix scan (perf task 2,
+/// 2026-11-13): the global pool bursts ALL cores on every chat hybrid
+/// query; a small fixed pool (default 2 threads, RAYON_KNN_THREADS env
+/// override, RAYON_NUM_THREADS as a conventional fallback) keeps the scan
+/// from stealing cores during search bursts.
+/// Trade-off: chat kNN runs at ~2 threads instead of N cores — slower in
+/// isolation, but search/BM25 latency no longer competes with the scan.
+/// Lives here (not AppState) because eval_knn runs inside the Engine, not
+/// the API layer; OnceLock gives one pool per process.
+static KNN_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+
+fn knn_pool() -> &'static rayon::ThreadPool {
+    KNN_POOL.get_or_init(|| {
+        let threads = ["RAYON_KNN_THREADS", "RAYON_NUM_THREADS"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .filter_map(|v| v.parse::<usize>().ok())
+            .find(|&n| n > 0)
+            .unwrap_or(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("knn rayon pool")
+    })
+}
 
 /// One corpus document — the original JSON (returned verbatim as
 /// `_source` minus `_source.excludes`) plus the fields the DSL needs.
@@ -245,7 +272,9 @@ impl SynonymDict {
         pairs: impl IntoIterator<Item = (Vec<String>, Vec<String>, Option<String>)>,
     ) -> Self {
         let stem_seq = |v: &[String]| -> Vec<String> {
-            v.iter().map(|w| stem_pl(&fold_str(w)).to_string()).collect()
+            v.iter()
+                .map(|w| stem_pl(&fold_str(w)).to_string())
+                .collect()
         };
         Self {
             pairs: pairs
@@ -271,9 +300,7 @@ impl SynonymDict {
     /// Does the rule apply in this context? (W2) Global rules always;
     /// scoped rules only when the query filters to their category.
     fn applies(ctx: &QueryCtx, category: &Option<String>) -> bool {
-        category
-            .as_ref()
-            .is_none_or(|c| ctx.categories.contains(c))
+        category.as_ref().is_none_or(|c| ctx.categories.contains(c))
     }
 }
 
@@ -319,7 +346,10 @@ fn expand_synonym_groups(
             if !SynonymDict::applies(ctx, &p.category) {
                 continue;
             }
-            for (seq, _alt) in [(p.a.as_slice(), p.b.as_slice()), (p.b.as_slice(), p.a.as_slice())] {
+            for (seq, _alt) in [
+                (p.a.as_slice(), p.b.as_slice()),
+                (p.b.as_slice(), p.a.as_slice()),
+            ] {
                 let len = seq.len();
                 if len >= 2
                     && i + len <= tokens.len()
@@ -336,7 +366,10 @@ fn expand_synonym_groups(
             // the group as the alternative (term or phrase)
             let side_fits = |seq: &[String]| {
                 i + seq.len() <= tokens.len()
-                    && seq.iter().zip(&tokens[i..i + seq.len()]).all(|(s, t)| s == t)
+                    && seq
+                        .iter()
+                        .zip(&tokens[i..i + seq.len()])
+                        .all(|(s, t)| s == t)
             };
             let (seq, alt) = if side_fits(&p.a) {
                 (p.a.as_slice(), p.b.as_slice())
@@ -346,7 +379,10 @@ fn expand_synonym_groups(
             let mut members = vec![GroupMember::Phrase(seq.to_vec())];
             push_alt(&mut members, alt);
             let span: Vec<usize> = (i..i + seq.len()).collect();
-            groups.push(SynonymGroup { members, tokens: span });
+            groups.push(SynonymGroup {
+                members,
+                tokens: span,
+            });
             i += seq.len();
             continue;
         }
@@ -358,7 +394,10 @@ fn expand_synonym_groups(
             if !SynonymDict::applies(ctx, &p.category) {
                 continue;
             }
-            for (seq, alt) in [(p.a.as_slice(), p.b.as_slice()), (p.b.as_slice(), p.a.as_slice())] {
+            for (seq, alt) in [
+                (p.a.as_slice(), p.b.as_slice()),
+                (p.b.as_slice(), p.a.as_slice()),
+            ] {
                 if seq.len() == 1 && &seq[0] == t {
                     push_alt(&mut members, alt);
                 }
@@ -712,13 +751,19 @@ pub struct Engine {
     /// Corpus generation (spec index-rs-docset W2) — bumped on every
     /// upsert/delete; invalidates the compound-filter cache.
     records_gen: std::sync::atomic::AtomicU64,
+    /// slug -> docno for LIVE docs (perf task 3, 2026-11-13): the
+    /// catalog get_by_slug term query (slug.keyword) and get_doc did a
+    /// full 200k-record scan per product page view; this map turns them
+    /// into O(1) lookups. Slugs are unique ids — on (re)upsert the entry
+    /// is overwritten, on delete it is removed. Only live docs are in
+    /// the map, so a hit implies !deleted.
+    slug_docnos: std::sync::RwLock<HashMap<String, usize>>,
     /// Live (non-deleted) doc count maintained at build/write — O(1) for
     /// DocSet::All totals (spec index-rs-docset W3).
     live_docs: std::sync::atomic::AtomicUsize,
     /// Cached results of the exact .NET AvailableFilter / ApprovedFilter
     /// compound shapes, per corpus generation (spec index-rs-docset W2).
-    filter_cache:
-        std::sync::RwLock<HashMap<u8, (u64, std::sync::Arc<BTreeMap<usize, f64>>)>>,
+    filter_cache: std::sync::RwLock<HashMap<u8, (u64, std::sync::Arc<BTreeMap<usize, f64>>)>>,
     /// Query-term counter (specs index-rs-query-mining +
     /// index-rs-zero-hit-mining W1) — (count, miss) per term, RAM only,
     /// per-boot; feeds the LLM synonym miner with the vocabulary users
@@ -776,10 +821,7 @@ fn compound_kind(b: &crate::dsn::BoolQuery) -> Option<u8> {
         && b.filter.is_empty()
         && b.must_not.is_empty()
         && b.should.len() == 2
-        && b.minimum_should_match
-            .as_ref()
-            .map(|m| m.required(2))
-            == Some(1)
+        && b.minimum_should_match.as_ref().map(|m| m.required(2)) == Some(1)
     {
         let Query::Term {
             field: term_field,
@@ -996,6 +1038,542 @@ fn collect_categories(q: &Query, out: &mut Vec<String>) {
     }
 }
 
+/// Tantivy IndexWriter heap budget (spec index-rs-scale-100x R2): the
+/// writer flushes segments itself when its heap fills, so a bounded heap
+/// keeps build RAM O(heap + batch) regardless of corpus size. Env
+/// `INDEX_HEAP_BUDGET_MB`, default 512 MB (the full-corpus commit/GC is
+/// what OOM'd production at the 2.5 GB container limit).
+pub fn heap_budget_mb() -> u64 {
+    std::env::var("INDEX_HEAP_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(512)
+}
+
+pub fn heap_budget_bytes() -> usize {
+    heap_budget_mb() as usize * 1024 * 1024
+}
+
+/// Resident set size in MB (spec index-rs-scale-100x R4 — OOM debugging
+/// observability). Reads /proc/self/statm on Linux; `None` elsewhere so
+/// /health reports `null` instead of a made-up number.
+pub fn rss_mb() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        // statm field 2 = resident pages; 4096 is the page size on every
+        // Linux arch the container images target (x86_64/aarch64).
+        let statm = fs::read_to_string("/proc/self/statm").ok()?;
+        let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(resident as f64 * 4096.0 / (1024.0 * 1024.0))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Empty per-field term dictionary set (both build paths start from this).
+fn empty_terms() -> HashMap<&'static str, BTreeSet<String>> {
+    TEXT_FIELDS
+        .iter()
+        .map(|name| (*name, BTreeSet::new()))
+        .collect()
+}
+
+/// Scratch containers have no /tmp — tempfile::tempdir needs an env TMPDIR
+/// that exists. Prefer the data dir, else create one under the first
+/// writable base (./, /data, / — scratch has no writable / without a dir
+/// baked into the image, so the Dockerfile pre-creates /data; local runs
+/// get an OS temp dir). Shared by both build paths.
+fn new_build_tempdir(data_dir: &Option<PathBuf>) -> Result<tempfile::TempDir, String> {
+    tempfile::tempdir_in(
+        data_dir
+            .clone()
+            .filter(|d| std::fs::create_dir_all(d).is_ok())
+            .unwrap_or_else(std::env::temp_dir),
+    )
+    .or_else(|_| tempfile::tempdir())
+    .map_err(|e| format!("tempdir: {e}"))
+}
+
+/// Build the tantivy schema + field handles once — shared by the Vec-based
+/// build (tests) and the streaming build (production) so the doc→tantivy
+/// mapping is identical by construction.
+fn make_schema() -> (Schema, HashMap<&'static str, Field>, Field, Field) {
+    let mut schema = Schema::builder();
+    let text_opts = || {
+        TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("ts")
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+    };
+    let mut text = HashMap::new();
+    for name in TEXT_FIELDS {
+        text.insert(name, schema.add_text_field(name, text_opts()));
+    }
+    let slug_field = schema.add_text_field(
+        "__slug",
+        TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        ),
+    );
+    let docno = schema.add_u64_field("docno", FAST);
+    (schema.build(), text, slug_field, docno)
+}
+
+/// Shared per-doc ingest (spec index-rs-scale-100x R2): record extraction,
+/// term dictionaries and the tantivy document mapping — ONE implementation
+/// behind both build paths, so search semantics cannot drift between them.
+struct DocIngest {
+    writer: tantivy::IndexWriter<TantivyDocument>,
+    text: HashMap<&'static str, Field>,
+    slug_field: Field,
+    docno_field: Field,
+    terms: HashMap<&'static str, BTreeSet<String>>,
+}
+
+impl DocIngest {
+    /// Index one doc as docno `i`; returns the extracted record.
+    fn ingest_one(&mut self, d: &EngineDoc, i: usize) -> Result<DocRec, String> {
+        let rec = extract_rec(&d.slug, &d.doc);
+        let mut tdoc = TantivyDocument::default();
+        for name in TEXT_FIELDS {
+            let texts = match name {
+                "tags" => rec.tags.to_vec(),
+                other => vec![d
+                    .doc
+                    .get(other)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()],
+            };
+            let field = self.text.get(name).copied().expect("field");
+            for text_val in texts {
+                for token in folded_tokens(&text_val) {
+                    self.terms.get_mut(name).expect("terms").insert(token);
+                }
+                if !text_val.trim().is_empty() {
+                    tdoc.add_text(field, text_val);
+                }
+            }
+        }
+        tdoc.add_text(self.slug_field, &d.slug);
+        tdoc.add_u64(self.docno_field, i as u64);
+        self.writer
+            .add_document(tdoc)
+            .map_err(|e| format!("tantivy add_document: {e}"))?;
+        Ok(rec)
+    }
+}
+
+/// Assemble the finished Engine — shared tail of both build paths.
+#[allow(clippy::too_many_arguments)]
+fn finish_engine(
+    records: Vec<DocRec>,
+    reader: IndexReader,
+    writer: tantivy::IndexWriter<TantivyDocument>,
+    fields: Fields,
+    terms: HashMap<&'static str, BTreeSet<String>>,
+    vectors: VectorStore,
+    synonyms: SynonymDict,
+    tmp: tempfile::TempDir,
+) -> Result<Engine, String> {
+    let live = records.iter().filter(|r| !r.deleted).count();
+    let slug_docnos = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.deleted)
+        .map(|(i, r)| (r.slug.clone(), i))
+        .collect();
+    Ok(Engine {
+        records: std::sync::RwLock::new(records),
+        reader,
+        writer: std::sync::Mutex::new(writer),
+        fields,
+        terms: std::sync::RwLock::new(terms),
+        vectors,
+        pending_vectors: std::sync::RwLock::new(HashMap::new()),
+        synonyms: std::sync::RwLock::new(synonyms),
+        query_log: std::sync::Mutex::new(BTreeMap::new()),
+        records_gen: std::sync::atomic::AtomicU64::new(0),
+        slug_docnos: std::sync::RwLock::new(slug_docnos),
+        live_docs: std::sync::atomic::AtomicUsize::new(live),
+        filter_cache: std::sync::RwLock::new(HashMap::new()),
+        _tmp: Some(tmp),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Streaming build (spec index-rs-scale-100x R2) — memory-flat engine
+// construction for corpora that no longer fit in RAM. Docs arrive in
+// batches and each batch is dropped after ingest; the vector matrix is
+// appended row-by-row to a staging file and finalized with an atomic
+// rename into the EXACT v3 layout the read path expects — zero changes
+// to VectorStore's readers.
+// ---------------------------------------------------------------------------
+
+/// Append-only sink for the quantized matrix payload (the n×dim×i8 part —
+/// scales stay in RAM, n×4 B, exactly like the mmap read path holds them).
+enum MatrixSink {
+    /// No data dir (tests) or staging failure — accumulate in RAM, like
+    /// VectorStore::build's in-RAM fallback.
+    Ram(Vec<i8>),
+    /// Append rows to a staging file in the data dir; `finalize_matrix`
+    /// streams header + scales + payload into `vectors.f32` and renames.
+    File(fs::File, tempfile::NamedTempFile),
+}
+
+impl MatrixSink {
+    fn new(data_dir: Option<&std::path::Path>) -> Self {
+        let staged = data_dir
+            .filter(|d| fs::create_dir_all(d).is_ok())
+            .and_then(|d| {
+                tempfile::Builder::new()
+                    .prefix(".vectors-matrix-")
+                    .tempfile_in(d)
+                    .ok()
+            });
+        match staged {
+            Some(f) => {
+                let file = f.as_file().try_clone().expect("fresh temp file clones");
+                MatrixSink::File(file, f)
+            }
+            None => MatrixSink::Ram(Vec::new()),
+        }
+    }
+
+    /// Append one quantized row (or a zero row). A staging write failure
+    /// recovers every row staged so far into RAM and continues in-RAM —
+    /// mmap persistence is a best-effort optimization, the matrix must
+    /// stay correct (same philosophy as VectorStore::build's fallback).
+    fn append_row(&mut self, row: &[i8]) -> Result<(), String> {
+        if let MatrixSink::File(w, _) = self {
+            let bytes: Vec<u8> = row.iter().map(|b| *b as u8).collect();
+            if w.write_all(&bytes).is_ok() {
+                return Ok(());
+            }
+            tracing::warn!("matrix staging write failed — recovering staged rows into RAM");
+            let staged = std::mem::replace(self, MatrixSink::Ram(Vec::new()));
+            let MatrixSink::File(w, ntf) = staged else {
+                unreachable!("just matched File");
+            };
+            drop(w);
+            let mut data: Vec<i8> = Vec::new();
+            let mut recovered = false;
+            if let Ok(mut f) = ntf.reopen() {
+                let mut buf = Vec::new();
+                if std::io::Read::read_to_end(&mut f, &mut buf).is_ok() {
+                    data = buf.iter().map(|b| *b as i8).collect();
+                    recovered = true;
+                }
+            }
+            drop(ntf); // removes the staging temp file
+            if !recovered {
+                return Err("matrix staging write failed and staged rows unrecoverable".into());
+            }
+            // the failed write may have left a PARTIAL row on disk —
+            // drop it (every append is a whole number of row.len() bytes,
+            // and scales/has_vec are pushed only AFTER a successful append)
+            let row_bytes = row.len();
+            data.truncate((data.len() / row_bytes) * row_bytes);
+            *self = MatrixSink::Ram(data);
+        }
+        match self {
+            MatrixSink::Ram(v) => {
+                v.extend_from_slice(row);
+                Ok(())
+            }
+            _ => unreachable!("File handled above"),
+        }
+    }
+}
+
+/// Incremental engine builder (spec index-rs-scale-100x R2). Created via
+/// [`Engine::streaming_build`], fed batches with [`StreamingBuild::add_batch`],
+/// converted to an [`Engine`] with [`StreamingBuild::finish`].
+///
+/// Matrix row order: row i is doc i's embedding, byte-identical to
+/// `VectorStore::build` — including `None`/mismatched-dim rows, which get
+/// an all-zero row, scale 0.0 and `has_vec = false` (kNN dot = 0 → neutral
+/// score). Docs seen before the first usable embedding fixed the dimension
+/// are deferred (`rows_before_dim`) and flushed as zero rows the moment
+/// the width is known, so row i = doc i always.
+pub struct StreamingBuild {
+    index: Index,
+    ingest: DocIngest,
+    records: Vec<DocRec>,
+    /// matrix width — None until the first non-empty embedding; Some(0)
+    /// means no usable embeddings at all (VectorStore::Empty semantics,
+    /// mirroring VectorStore::build's find_map on the first row).
+    dim: Option<usize>,
+    rows_before_dim: usize,
+    scales: Vec<f32>,
+    has_vec: Vec<bool>,
+    matrix: MatrixSink,
+    synonyms: SynonymDict,
+    data_dir: Option<PathBuf>,
+    tmp: tempfile::TempDir,
+    docs: usize,
+    started: Instant,
+}
+
+impl StreamingBuild {
+    /// Ingest one batch of docs (spec R2: ~500-1000 per batch). Each doc is
+    /// moved out of the batch and dropped after its tantivy add — no
+    /// accumulation anywhere. Progress is traced every 10k docs.
+    pub fn add_batch(&mut self, batch: Vec<EngineDoc>) -> Result<(), String> {
+        for d in batch {
+            let rec = self.ingest.ingest_one(&d, self.docs)?;
+            self.records.push(rec);
+            let emb = d.embedding;
+            self.push_vector_row(emb)?;
+            self.docs += 1;
+            if self.docs % 10_000 == 0 {
+                tracing::info!(
+                    docs = self.docs,
+                    elapsed_s = (self.started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                    rss_mb = rss_mb(),
+                    "indexed docs (streaming build)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Append doc i's matrix row — replicating VectorStore::build's
+    /// semantics exactly: normalize + symmetric int8 quantize per row,
+    /// zero row + 0.0 scale for None/mismatched embeddings.
+    fn push_vector_row(&mut self, emb: Option<Vec<f32>>) -> Result<(), String> {
+        let Some(e) = emb else {
+            if self.dim.is_none() {
+                self.rows_before_dim += 1;
+            }
+            if let Some(dim) = self.dim {
+                self.matrix.append_row(&vec![0i8; dim])?;
+            }
+            self.scales.push(0.0);
+            self.has_vec.push(false);
+            return Ok(());
+        };
+        match self.dim {
+            None if e.is_empty() => {
+                // mirrors VectorStore::build: dim comes from the FIRST
+                // non-None embedding — an empty one yields dim 0 → Empty
+                self.dim = Some(0);
+                self.scales.push(0.0);
+                self.has_vec.push(false);
+                Ok(())
+            }
+            None => {
+                // first usable embedding fixes the width — flush the
+                // deferred zero rows for docs 0..rows_before_dim FIRST so
+                // row order matches doc order (row i = doc i)
+                let dim = e.len();
+                self.dim = Some(dim);
+                if self.rows_before_dim > 0 {
+                    self.matrix
+                        .append_row(&vec![0i8; dim * self.rows_before_dim])?;
+                }
+                self.push_quantized(&e)
+            }
+            Some(0) => {
+                // Empty store — every row counts as missing
+                self.scales.push(0.0);
+                self.has_vec.push(false);
+                Ok(())
+            }
+            Some(dim) if e.len() == dim => self.push_quantized(&e),
+            Some(dim) => {
+                // mismatched dimension — zero row, has_vec = false
+                self.matrix.append_row(&vec![0i8; dim])?;
+                self.scales.push(0.0);
+                self.has_vec.push(false);
+                Ok(())
+            }
+        }
+    }
+
+    fn push_quantized(&mut self, e: &[f32]) -> Result<(), String> {
+        let normed = l2_normalize(e);
+        let (q, s) = quantize_row(&normed);
+        // append first — on an unrecoverable staging failure the row (and
+        // its scale/has_vec entry) simply never land, and the whole build
+        // aborts with an error instead of corrupting row↔doc alignment
+        self.matrix.append_row(&q)?;
+        self.scales.push(s);
+        self.has_vec.push(true);
+        Ok(())
+    }
+
+    /// Commit tantivy, finalize the vector matrix, assemble the Engine.
+    pub fn finish(self) -> Result<Engine, String> {
+        let Self {
+            index,
+            ingest,
+            records,
+            dim,
+            rows_before_dim: _,
+            scales,
+            has_vec,
+            matrix,
+            synonyms,
+            data_dir,
+            tmp,
+            docs,
+            started,
+        } = self;
+        let DocIngest {
+            mut writer,
+            text,
+            terms,
+            slug_field,
+            docno_field: docno,
+            ..
+        } = ingest;
+        writer
+            .commit()
+            .map_err(|e| format!("tantivy commit: {e}"))?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| format!("tantivy reader: {e}"))?;
+        let _ = reader.reload();
+        let vectors = finalize_matrix(dim, scales, has_vec, matrix, data_dir.as_deref());
+        let fields = Fields {
+            text,
+            slug: slug_field,
+            docno,
+        };
+        tracing::info!(
+            docs,
+            elapsed_s = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+            rss_mb = rss_mb(),
+            "streaming build complete"
+        );
+        finish_engine(records, reader, writer, fields, terms, vectors, synonyms, tmp)
+    }
+}
+
+/// Finalize the streamed matrix into a VectorStore — byte-identical v3
+/// layout (16-byte header + n×f32 scales + n×dim×i8), same readers, same
+/// warm-start page fault-in as VectorStore::build. The staged payload is
+/// streamed into a staging file next to the final path, fsynced, then
+/// ATOMICALLY renamed over `vectors.f32`: a crash mid-build can only leave
+/// the previous matrix intact plus garbage staging files — never a torn
+/// matrix.
+fn finalize_matrix(
+    dim: Option<usize>,
+    scales: Vec<f32>,
+    has_vec: Vec<bool>,
+    matrix: MatrixSink,
+    data_dir: Option<&std::path::Path>,
+) -> VectorStore {
+    let Some(dim) = dim.filter(|d| *d > 0) else {
+        return VectorStore::Empty;
+    };
+    let n = scales.len();
+    debug_assert_eq!(n, has_vec.len());
+    // no data dir (tests) or staging failure — in-RAM, like
+    // VectorStore::build's fallback; data holds the streamed rows
+    let (mut payload_file, payload_tmp) = match matrix {
+        MatrixSink::Ram(data) => {
+            return VectorStore::Ram {
+                data,
+                scales,
+                n,
+                dim,
+                has_vec,
+            }
+        }
+        MatrixSink::File(f, t) => (f, t),
+    };
+    let _ = payload_file.flush();
+    let dir = data_dir.expect("staging exists only with a data dir");
+    let _ = payload_tmp.as_file().sync_all();
+    // keep() detaches the temp-file auto-delete; we remove it manually below
+    let payload_path = match payload_tmp.keep() {
+        Ok((_, path)) => path,
+        Err(e) => {
+            tracing::warn!(error = %e, "matrix staging keep failed — in-RAM read-back");
+            return read_back_ram(dir, dim, scales, has_vec, n).unwrap_or(VectorStore::Empty);
+        }
+    };
+    let final_path = dir.join("vectors.f32");
+    let staging_path = dir.join("vectors.f32.new");
+    let finalize = (|| -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::new(fs::File::create(&staging_path)?);
+        out.write_all(&VECTORS_MAGIC.to_le_bytes())?;
+        out.write_all(&VECTORS_VERSION.to_le_bytes())?;
+        out.write_all(&(dim as u32).to_le_bytes())?;
+        out.write_all(&(n as u32).to_le_bytes())?;
+        for s in &scales {
+            out.write_all(&s.to_le_bytes())?;
+        }
+        // stream the payload — never held in RAM
+        let mut payload = fs::File::open(&payload_path)?;
+        std::io::copy(&mut payload, &mut out)?;
+        out.flush()?;
+        out.get_ref().sync_all()?;
+        drop(out);
+        // atomic swap — readers never observe a partial matrix
+        fs::rename(&staging_path, &final_path)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&payload_path);
+    if let Err(e) = finalize {
+        tracing::warn!(error = %e, "matrix finalize failed — in-RAM read-back");
+        return read_back_ram(dir, dim, scales, has_vec, n).unwrap_or(VectorStore::Empty);
+    }
+    // mmap — the exact same read path + warm-start fault-in as
+    // VectorStore::build
+    if let Ok(map) = unsafe { memmap2::Mmap::map(&path_as_file(&final_path)) } {
+        if map.len() >= 16 + n * 4 + n * dim {
+            // fault in ALL pages now — first kNN query after boot must
+            // not pay volume reads (spec index-rs-knn-warm-start W1)
+            let sum: u64 = map.chunks(4096).map(|c| c[0] as u64).sum();
+            std::hint::black_box(sum);
+            return VectorStore::Mmap {
+                map,
+                scales,
+                n,
+                dim,
+                has_vec,
+            };
+        }
+    }
+    tracing::warn!("vector mmap failed — reading matrix back into RAM");
+    read_back_ram(dir, dim, scales, has_vec, n).unwrap_or(VectorStore::Empty)
+}
+
+/// In-RAM fallback reconstructed from the finalized file (the mmap failed
+/// but the bytes on disk are good — same RAM footprint as
+/// VectorStore::build's in-RAM mode).
+fn read_back_ram(
+    dir: &std::path::Path,
+    dim: usize,
+    scales: Vec<f32>,
+    has_vec: Vec<bool>,
+    n: usize,
+) -> Option<VectorStore> {
+    let bytes = fs::read(dir.join("vectors.f32")).ok()?;
+    if bytes.len() < 16 + n * 4 + n * dim {
+        return None;
+    }
+    let data = bytes[16 + n * 4..].iter().map(|b| *b as i8).collect();
+    Some(VectorStore::Ram {
+        data,
+        scales,
+        n,
+        dim,
+        has_vec,
+    })
+}
+
 impl Engine {
     /// Build the engine from corpus docs (PG rows or synthetic test data).
     /// `data_dir` is used for the vector matrix persistence (mmap); the
@@ -1016,88 +1594,38 @@ impl Engine {
         if let Some(d) = data_dir.as_ref() {
             sweep_stale_tempdirs(d);
         }
-        // scratch containers have no /tmp — tempfile::tempdir needs an env
-        // TMPDIR that exists. Prefer the data dir, else create one under the
-        // first writable base (./, /data, / — scratch has no writable /
-        // without a dir baked into the image, so the Dockerfile pre-creates
-        // /data; local runs get an OS temp dir).
-        let tmp = tempfile::tempdir_in(
-            data_dir
-                .clone()
-                .filter(|d| std::fs::create_dir_all(d).is_ok())
-                .unwrap_or_else(std::env::temp_dir),
-        )
-        .or_else(|_| tempfile::tempdir())
-        .map_err(|e| format!("tempdir: {e}"))?;
-        let mut schema = Schema::builder();
-        let text_opts = || {
-            TextOptions::default().set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("ts")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            )
-        };
-        let mut text = HashMap::new();
-        for name in TEXT_FIELDS {
-            text.insert(name, schema.add_text_field(name, text_opts()));
-        }
-        let slug_field = schema.add_text_field(
-            "__slug",
-            TextOptions::default().set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("raw")
-                    .set_index_option(IndexRecordOption::Basic),
-            ),
-        );
-        let docno = schema.add_u64_field("docno", FAST);
-        let schema = schema.build();
+        let tmp = new_build_tempdir(&data_dir)?;
+        let (schema, text, slug_field, docno) = make_schema();
         let index = Index::create_in_dir(tmp.path(), schema)
             .map_err(|e| format!("create tantivy index: {e}"))?;
         index.tokenizers().register("ts", TsTokenizer);
-
-        let mut writer = index
+        let writer = index
             .writer::<TantivyDocument>(100_000_000)
             .map_err(|e| format!("tantivy writer: {e}"))?;
-
+        let mut ingest = DocIngest {
+            writer,
+            text,
+            slug_field,
+            docno_field: docno,
+            terms: empty_terms(),
+        };
         let mut records: Vec<DocRec> = Vec::with_capacity(docs.len());
-        let mut terms: HashMap<&'static str, BTreeSet<String>> = HashMap::new();
-        for name in TEXT_FIELDS {
-            terms.insert(name, BTreeSet::new());
-        }
         // embeddings travel parallel to records (extract_rec no longer
         // stores them — the mmap matrix is their only long-term home)
         let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(docs.len());
-        for (i, d) in docs.into_iter().enumerate() {
-            let rec = extract_rec(&d.slug, &d.doc);
-            embeddings.push(d.embedding);
-            let mut tdoc = TantivyDocument::default();
-            for name in TEXT_FIELDS {
-                let texts = match name {
-                    "tags" => rec.tags.to_vec(),
-                    other => vec![d
-                        .doc
-                        .get(other)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string()],
-                };
-                let field = text.get(name).copied().expect("field");
-                for text_val in texts {
-                    for token in folded_tokens(&text_val) {
-                        terms.get_mut(name).expect("terms").insert(token);
-                    }
-                    if !text_val.trim().is_empty() {
-                        tdoc.add_text(field, text_val);
-                    }
-                }
-            }
-            tdoc.add_text(slug_field, &d.slug);
-            tdoc.add_u64(docno, i as u64);
-            writer
-                .add_document(tdoc)
-                .map_err(|e| format!("tantivy add_document: {e}"))?;
-            records.push(rec);
+        for (i, mut d) in docs.into_iter().enumerate() {
+            let emb = d.embedding.take();
+            records.push(ingest.ingest_one(&d, i)?);
+            embeddings.push(emb);
         }
+        let DocIngest {
+            mut writer,
+            text,
+            terms,
+            slug_field,
+            docno_field: docno,
+            ..
+        } = ingest;
         writer
             .commit()
             .map_err(|e| format!("tantivy commit: {e}"))?;
@@ -1113,26 +1641,102 @@ impl Engine {
             slug: slug_field,
             docno,
         };
-        let live = records.iter().filter(|r| !r.deleted).count();
-        Ok(Engine {
-            records: std::sync::RwLock::new(records),
-            reader,
-            writer: std::sync::Mutex::new(writer),
-            fields,
-            terms: std::sync::RwLock::new(terms),
-            vectors,
-            pending_vectors: std::sync::RwLock::new(HashMap::new()),
-            synonyms: std::sync::RwLock::new(synonyms),
-            query_log: std::sync::Mutex::new(BTreeMap::new()),
-            records_gen: std::sync::atomic::AtomicU64::new(0),
-            live_docs: std::sync::atomic::AtomicUsize::new(live),
-            filter_cache: std::sync::RwLock::new(HashMap::new()),
-            _tmp: Some(tmp),
+        finish_engine(records, reader, writer, fields, terms, vectors, synonyms, tmp)
+    }
+
+    /// Memory-flat streaming build (spec index-rs-scale-100x R2): batch
+    /// iterator in, engine out. Every batch is dropped after ingest and
+    /// the vector matrix is appended row-by-row to a staging file, so
+    /// peak RSS is O(tantivy heap + batch) regardless of corpus size.
+    /// Production hot paths use [`Engine::streaming_build`] with async
+    /// feeding (no Vec materialization at all); this constructor is the
+    /// test seam.
+    pub fn build_streaming<I>(
+        data_dir: Option<PathBuf>,
+        synonyms: SynonymDict,
+        heap_bytes: usize,
+        batches: I,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = Vec<EngineDoc>>,
+    {
+        let mut b = Self::streaming_build(data_dir, synonyms, heap_bytes)?;
+        for batch in batches {
+            b.add_batch(batch)?;
+        }
+        b.finish()
+    }
+
+    /// Start a streaming build (spec index-rs-scale-100x R2): feed batches
+    /// via [`StreamingBuild::add_batch`], then [`StreamingBuild::finish`].
+    /// The tantivy writer gets `heap_bytes` of heap (see
+    /// [`heap_budget_bytes`]) and flushes segments itself.
+    pub fn streaming_build(
+        data_dir: Option<PathBuf>,
+        synonyms: SynonymDict,
+        heap_bytes: usize,
+    ) -> Result<StreamingBuild, String> {
+        if let Some(d) = data_dir.as_ref() {
+            sweep_stale_tempdirs(d);
+        }
+        let tmp = new_build_tempdir(&data_dir)?;
+        let (schema, text, slug_field, docno) = make_schema();
+        let index = Index::create_in_dir(tmp.path(), schema)
+            .map_err(|e| format!("create tantivy index: {e}"))?;
+        index.tokenizers().register("ts", TsTokenizer);
+        let writer = index
+            .writer::<TantivyDocument>(heap_bytes)
+            .map_err(|e| format!("tantivy writer: {e}"))?;
+        let ingest = DocIngest {
+            writer,
+            text,
+            slug_field,
+            docno_field: docno,
+            terms: empty_terms(),
+        };
+        Ok(StreamingBuild {
+            index,
+            ingest,
+            records: Vec::new(),
+            dim: None,
+            rows_before_dim: 0,
+            scales: Vec::new(),
+            has_vec: Vec::new(),
+            matrix: MatrixSink::new(data_dir.as_deref()),
+            synonyms,
+            data_dir,
+            tmp,
+            docs: 0,
+            started: Instant::now(),
         })
     }
 
     pub fn num_docs(&self) -> usize {
         self.recs().iter().filter(|r| !r.deleted).count()
+    }
+
+    /// Current corpus generation (bumped on every upsert/delete) — the
+    /// API-layer hot-query cache keys on it (see query_cache.rs), the
+    /// same generation the compound filter_cache already uses.
+    pub fn records_gen(&self) -> u64 {
+        self.records_gen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// O(1) live-doc lookup by slug (perf task 3) — `None` means no live
+    /// doc carries this slug. Hits are verified against the record table
+    /// (not deleted, slug matches) before use — the map is advisory.
+    fn slug_docno(&self, slug: &str) -> Option<usize> {
+        let i = *self
+            .slug_docnos
+            .read()
+            .expect("slug map lock poisoned")
+            .get(slug)?;
+        let records = self.recs();
+        let r = records.get(i)?;
+        if r.deleted || r.slug != slug {
+            return None;
+        }
+        Some(i)
     }
 
     /// Pending (post-build) vector count — the rebuilder gate input
@@ -1224,10 +1828,8 @@ impl Engine {
     /// (term, count, miss), miss desc then count desc, alpha tie-break.
     pub fn query_terms(&self, limit: usize) -> Vec<(String, u64, u64)> {
         let log = self.query_log.lock().expect("query log lock poisoned");
-        let mut out: Vec<(String, u64, u64)> = log
-            .iter()
-            .map(|(k, (c, m))| (k.clone(), *c, *m))
-            .collect();
+        let mut out: Vec<(String, u64, u64)> =
+            log.iter().map(|(k, (c, m))| (k.clone(), *c, *m)).collect();
         out.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
         out.truncate(limit);
         out
@@ -1280,10 +1882,7 @@ impl Engine {
         for t in set.iter() {
             let count = searcher
                 .search(
-                    &TermQuery::new(
-                        Term::from_field_text(field, t),
-                        IndexRecordOption::Basic,
-                    ),
+                    &TermQuery::new(Term::from_field_text(field, t), IndexRecordOption::Basic),
                     &tantivy::collector::Count,
                 )
                 .unwrap_or(0);
@@ -1392,9 +1991,7 @@ impl Engine {
                     }
                     _ => match Self::str_field_cow(rec, f) {
                         Some(s) => !s.is_empty(),
-                        None => raw_value(rec, f)
-                            .map(|v| !v.is_null())
-                            .is_some_and(|v| v),
+                        None => raw_value(rec, f).map(|v| !v.is_null()).is_some_and(|v| v),
                     },
                 }
             }
@@ -1449,12 +2046,14 @@ impl Engine {
             })),
             Query::Exists { field } => {
                 let records = self.recs();
-                Ok(DocSet::map(records
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, r)| !r.deleted && self.exists_field(r, *i, field))
-                    .map(|(i, _)| (i, 1.0))
-                    .collect()))
+                Ok(DocSet::map(
+                    records
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, r)| !r.deleted && self.exists_field(r, *i, field))
+                        .map(|(i, _)| (i, 1.0))
+                        .collect(),
+                ))
             }
             Query::Bool(b) => {
                 // W2 (spec index-rs-docset): the exact .NET AvailableFilter /
@@ -1559,6 +2158,21 @@ impl Engine {
 
     fn eval_term(&self, field: &str, value: &crate::dsn::TermValue) -> BTreeMap<usize, f64> {
         use crate::dsn::TermValue;
+        // Perf task 3 (2026-11-13): slug term queries (the catalog
+        // get_by_slug body — term/terms on slug.keyword) are the #1
+        // per-product-page query; the slug map answers them O(1) instead
+        // of a full corpus scan. Only live docs are in the map and both
+        // str_field fallbacks return rec.slug for slug fields, so hit and
+        // miss are byte-identical to the scan below. Anything else (bool,
+        // num, other fields) keeps the scan.
+        if let TermValue::Str(s) = value {
+            if field == "slug" || field == "slug.keyword" {
+                return match self.slug_docno(s) {
+                    Some(docno) => BTreeMap::from([(docno, 1.0)]),
+                    None => BTreeMap::new(),
+                };
+            }
+        }
         let records = self.recs();
         let mut out = BTreeMap::new();
         for (i, r) in records.iter().enumerate() {
@@ -1597,11 +2211,7 @@ impl Engine {
         out
     }
 
-    fn eval_bool(
-        &self,
-        b: &crate::dsn::BoolQuery,
-        ctx: &QueryCtx,
-    ) -> Result<DocSet, String> {
+    fn eval_bool(&self, b: &crate::dsn::BoolQuery, ctx: &QueryCtx) -> Result<DocSet, String> {
         // W1 (spec index-rs-docset): must/filter fold over DocSet — All
         // shortcuts skip the match_all map entirely (81k inserts saved on
         // every public query); must intersections sum scores (All side
@@ -1613,12 +2223,12 @@ impl Engine {
                 None => r,
                 Some(acc) => match (&acc, &r) {
                     (DocSet::All, DocSet::All) => DocSet::All,
-                    (DocSet::All, DocSet::Map(rm)) => DocSet::map(
-                        rm.iter().map(|(doc, s)| (*doc, s + 1.0)).collect(),
-                    ),
-                    (DocSet::Map(am), DocSet::All) => DocSet::map(
-                        am.iter().map(|(doc, s)| (*doc, s + 1.0)).collect(),
-                    ),
+                    (DocSet::All, DocSet::Map(rm)) => {
+                        DocSet::map(rm.iter().map(|(doc, s)| (*doc, s + 1.0)).collect())
+                    }
+                    (DocSet::Map(am), DocSet::All) => {
+                        DocSet::map(am.iter().map(|(doc, s)| (*doc, s + 1.0)).collect())
+                    }
                     (DocSet::Map(am), DocSet::Map(rm)) => {
                         let mut out = BTreeMap::new();
                         for (doc, s) in am.iter() {
@@ -1700,10 +2310,7 @@ impl Engine {
         let mut out = BTreeMap::new();
         if b.should.is_empty() {
             for doc in base {
-                let score = must
-                    .as_ref()
-                    .map(|m| m.score(doc))
-                    .unwrap_or(1.0);
+                let score = must.as_ref().map(|m| m.score(doc)).unwrap_or(1.0);
                 out.insert(doc, score);
             }
             return Ok(DocSet::map(out));
@@ -2179,30 +2786,34 @@ impl Engine {
             .read()
             .expect("pending lock poisoned")
             .clone();
-        // W3: parallel score scan (rayon) over the matrix rows. Rows
+        // W3: parallel score scan (rayon) over the matrix rows, pinned to
+        // the small dedicated KNN pool (perf task 2) instead of the global
+        // one. Rows
         // without a vector and rows overridden by pending upserts score
         // -inf and are filtered below — the pending loop re-scores those
         // (and rows beyond the matrix, which are pending-only).
-        let scores: Vec<f32> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if !has_vec[i] || pending.contains_key(&i) {
-                    return f32::NEG_INFINITY;
-                }
-                // W3 (spec index-rs-rebuild-churn): tombstoned docs keep
-                // their matrix row until compaction — never resurface them
-                if self.recs()[i].deleted {
-                    return f32::NEG_INFINITY;
-                }
-                let (r8, s_r) = self.vectors.row8(i).expect("row present");
-                let mut acc: i32 = 0;
-                for j in 0..dim {
-                    acc += q8[j] as i32 * r8[j] as i32;
-                }
-                // 127² = 16129; clamp guards rounding overshoot
-                (acc as f32 * s_q * s_r / 16129.0).clamp(-1.0, 1.0)
-            })
-            .collect();
+        let scores: Vec<f32> = knn_pool().install(|| {
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    if !has_vec[i] || pending.contains_key(&i) {
+                        return f32::NEG_INFINITY;
+                    }
+                    // W3 (spec index-rs-rebuild-churn): tombstoned docs keep
+                    // their matrix row until compaction — never resurface them
+                    if self.recs()[i].deleted {
+                        return f32::NEG_INFINITY;
+                    }
+                    let (r8, s_r) = self.vectors.row8(i).expect("row present");
+                    let mut acc: i32 = 0;
+                    for j in 0..dim {
+                        acc += q8[j] as i32 * r8[j] as i32;
+                    }
+                    // 127² = 16129; clamp guards rounding overshoot
+                    (acc as f32 * s_q * s_r / 16129.0).clamp(-1.0, 1.0)
+                })
+                .collect()
+        });
         let mut scored: Vec<(usize, f32)> = scores
             .into_iter()
             .enumerate()
@@ -2333,7 +2944,9 @@ impl Engine {
             "tags" | "tags.keyword" => rec.tags.iter().map(|s| s.as_str()).collect(),
             "slug" | "slug.keyword" => vec![rec.slug.as_str()],
             "title" | "title.keyword" => vec![rec.title.as_str()],
-            other => Self::str_field(rec, other).map(|s| vec![s]).unwrap_or_default(),
+            other => Self::str_field(rec, other)
+                .map(|s| vec![s])
+                .unwrap_or_default(),
         }
     }
 
@@ -2564,9 +3177,8 @@ impl Engine {
         if req.search_after.is_none() && req.from == 0 && req.size < docnos.len() {
             let records = self.recs();
             let page: Vec<usize> = {
-                let cmp = |a: &usize, b: &usize| {
-                    self.cmp_docnos(&records, *a, *b, &sorts, &matched)
-                };
+                let cmp =
+                    |a: &usize, b: &usize| self.cmp_docnos(&records, *a, *b, &sorts, &matched);
                 docnos.select_nth_unstable_by(req.size, cmp);
                 let mut top: Vec<usize> = docnos[..req.size].to_vec();
                 top.sort_unstable_by(cmp);
@@ -2725,11 +3337,12 @@ impl Engine {
 
     /// Full doc fetch for the write path: (source JSON, stored embedding).
     pub fn get_doc(&self, id: &str) -> Option<(Value, Option<Vec<f32>>)> {
+        // Perf task 3: O(1) slug map lookup replaces the linear scan (the
+        // defensive re-check inside slug_docno preserves the exact
+        // not-deleted semantics of the old find()).
+        let i = self.slug_docno(id)?;
         let records = self.recs();
-        let (i, r) = records
-            .iter()
-            .enumerate()
-            .find(|(_, r)| !r.deleted && r.slug == id)?;
+        let r = &records[i];
         let emb = self
             .pending_vectors
             .read()
@@ -2737,7 +3350,10 @@ impl Engine {
             .get(&i)
             .cloned()
             .or_else(|| self.vectors.row_vec(i));
-        Some((serde_json::from_str(&raw_str(r)).unwrap_or(Value::Null), emb))
+        Some((
+            serde_json::from_str(&raw_str(r)).unwrap_or(Value::Null),
+            emb,
+        ))
     }
 
     /// Slugs matching a query (the _update_by_query/_delete_by_query
@@ -2793,15 +3409,12 @@ impl Engine {
         {
             let mut writer = self.writer.lock().expect("writer lock");
             let _ = writer.delete_term(Term::from_field_text(self.fields.slug, slug));
-            let docno = {
-                let records = self.recs();
-                match records.iter().position(|r| !r.deleted && r.slug == slug) {
-                    Some(slot) => slot,
-                    None => {
-                        // slot index of the (tombstoned or absent) old entry
-                        // is unknown — the new record goes to the end
-                        records.len()
-                    }
+            let docno = match self.slug_docno(slug) {
+                Some(slot) => slot,
+                None => {
+                    // slot index of the (tombstoned or absent) old entry
+                    // is unknown — the new record goes to the end
+                    self.recs().len()
                 }
             };
             let _ = writer.add_document(self.tantivy_of(slug, &doc, docno));
@@ -2836,8 +3449,15 @@ impl Engine {
                 }
             }
         }
+        // Slug map + records mutate together (slug-map guard taken first —
+        // the readers in slug_docno take the same order, so no deadlock).
+        // Perf task 3: the old position() scan is now an O(1) map hit.
+        let mut slugs = self.slug_docnos.write().expect("slug map lock poisoned");
         let mut records = self.records.write().expect("records lock");
-        let slot = records.iter().position(|r| !r.deleted && r.slug == slug);
+        let slot = slugs
+            .get(slug)
+            .copied()
+            .filter(|&i| records.get(i).is_some_and(|r| !r.deleted && r.slug == slug));
         let existed = slot.is_some();
         let rec = extract_rec(slug, &doc);
         {
@@ -2855,8 +3475,12 @@ impl Engine {
             }
         }
         match slot {
-            Some(i) => records[i] = rec,
+            Some(i) => {
+                records[i] = rec;
+                slugs.insert(slug.to_string(), i);
+            }
             None => {
+                slugs.insert(slug.to_string(), records.len());
                 records.push(rec);
                 self.live_docs
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2877,14 +3501,22 @@ impl Engine {
             let _ = writer.commit();
         }
         let _ = self.reader.reload();
+        // Perf task 3: O(1) slot lookup via the slug map (guard order
+        // slug-map -> records, matching the readers).
+        let mut slugs = self.slug_docnos.write().expect("slug map lock poisoned");
         let mut records = self.records.write().expect("records lock");
-        let Some(slot) = records.iter().position(|r| !r.deleted && r.slug == slug) else {
+        let Some(slot) = slugs
+            .get(slug)
+            .copied()
+            .filter(|&i| records.get(i).is_some_and(|r| !r.deleted && r.slug == slug))
+        else {
             return false;
         };
         self.live_docs
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.records_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        slugs.remove(slug);
         records[slot] = DocRec {
             slug: String::new(),
             title: String::new(),

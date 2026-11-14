@@ -37,6 +37,9 @@ pub struct AppState {
     /// set after every write — the background task rebuilds the vector
     /// matrix (full engine rebuild from Postgres) with debounce
     pub vectors_dirty: std::sync::atomic::AtomicBool,
+    /// LRU (FIFO) hot-query cache in front of search_handler — keyed by
+    /// (engine Arc ptr, records_gen, body hash); see query_cache.rs.
+    pub search_cache: crate::query_cache::SearchCache,
     /// false until the initial index build from Postgres finished
     /// (serve-first boot: /health answers 200 immediately; `ready`
     /// distinguishes "listener up" from "index built")
@@ -52,6 +55,15 @@ impl AppState {
     pub fn is_ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Attach the `X-Cache: HIT|MISS` observability header to a search
+/// response (the cache layer — see query_cache.rs).
+fn with_cache_header(mut resp: Response, status: &'static str) -> Response {
+    if let Ok(v) = axum::http::HeaderValue::from_str(status) {
+        resp.headers_mut().insert("x-cache", v);
+    }
+    resp
 }
 
 /// OpenSearch-shaped parsing error (status 400).
@@ -126,16 +138,33 @@ pub struct SearchParams {
 
 pub async fn search_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(index): Path<String>,
     Query(params): Query<SearchParams>,
     Json(body): Json<Value>,
 ) -> Response {
+    // NOTE: this endpoint is fully public — no auth or x-rebuild-secret
+    // header influences the result, so no header can make a cached copy
+    // unauthorized. The only header concern is the caller asking to
+    // bypass (no-cache / no-store below).
+    let bypass_cache = headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let v = v.to_ascii_lowercase();
+            v.contains("no-cache") || v.contains("no-store")
+        })
+        || headers
+            .get("prefer")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
+    let scroll_requested = params.scroll.is_some();
+
     let engine = state.engine.read().await.clone();
     let req = match crate::dsn::parse_search_body(&body) {
         Ok(r) => r,
         Err(e) => return parsing_error(&e.0, &index),
     };
-    let scroll_requested = params.scroll.is_some();
     // Scroll: materialize the whole result set once (capped), page it out
     // of the scroll context. Non-scroll requests behave exactly as before.
     let mut req = req;
@@ -143,10 +172,37 @@ pub async fn search_handler(
     if scroll_requested {
         req.size = 100_000;
     }
+    // Cacheable only when: not a scroll request, not a bypass header, and
+    // the caller did not ask for a page beyond... (no such thing here —
+    // from/size is part of the hashed body). The key folds in the engine
+    // Arc pointer (full-rebuild swap invalidates) and records_gen (every
+    // upsert/delete bumps it — filter_cache uses the same generation).
+    let cacheable = is_cacheable(scroll_requested, bypass_cache);
+    let cache_key: Option<crate::query_cache::CacheKey> = if cacheable {
+        Some((
+            std::sync::Arc::as_ptr(&engine) as usize,
+            engine.records_gen(),
+            crate::query_cache::body_hash(&serde_json::to_vec(&body).unwrap_or_default()),
+        ))
+    } else {
+        None
+    };
+    if let Some(k) = &cache_key {
+        if let Some(cached) = state.search_cache.get(k) {
+            return with_cache_header(Json(cached).into_response(), "HIT");
+        }
+    }
     match engine.search(&req) {
         Ok(outcome) => {
             if !scroll_requested {
-                return Json(search_response(&index, &outcome)).into_response();
+                let resp = search_response(&index, &outcome);
+                // bypass (no-cache header) requests are served but never
+                // stored, and carry no X-Cache header at all
+                if let Some(k) = cache_key {
+                    state.search_cache.put(k, resp.clone());
+                    return with_cache_header(Json(resp).into_response(), "MISS");
+                }
+                return Json(resp).into_response();
             }
             let all: Vec<Value> = outcome.hits.iter().map(|h| hit_entry(&index, h)).collect();
             static SCROLL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -347,18 +403,8 @@ pub async fn rebuild_handler(State(state): State<Arc<AppState>>, headers: Header
         )
             .into_response();
     };
-    // Load → build (blocking) → swap into the shared engine lock.
-    let docs = match crate::store::load_all(&pool).await {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "rebuild": false, "error": e })),
-            )
-                .into_response()
-        }
-    };
-    let n = docs.len();
+    // Stream → build (memory-flat, spec index-rs-scale-100x R3) → swap into
+    // the shared engine lock.
     // dynamic synonyms ride every rebuild (spec index-rs-dynamic-synonyms W5)
     let synonyms = match crate::store::load_synonym_dict(&pool).await {
         Ok(d) => d,
@@ -368,35 +414,31 @@ pub async fn rebuild_handler(State(state): State<Arc<AppState>>, headers: Header
         }
     };
     let data_dir = std::env::var("DATA_DIR").map(std::path::PathBuf::from).ok();
-    let engine = match tokio::task::spawn_blocking(move || {
-        crate::engine::Engine::build_with_synonyms(docs, data_dir, synonyms)
-    })
-    .await
-        {
-            Ok(Ok(e)) => e,
-            Ok(Err(e)) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "rebuild": false, "error": e })),
-                )
-                    .into_response()
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "rebuild": false, "error": e.to_string() })),
-                )
-                    .into_response()
-            }
-        };
-    *state.engine.write().await = Arc::new(engine);
-    Json(json!({ "rebuild": true, "docs": n })).into_response()
+    match crate::build_engine_streaming(&pool, data_dir, synonyms).await {
+        Ok((engine, n)) => {
+            *state.engine.write().await = Arc::new(engine);
+            Json(json!({ "rebuild": true, "docs": n })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "rebuild": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Response {
     let engine = state.engine.read().await.clone();
-    Json(json!({ "status": "ok", "docs": engine.num_docs(), "ready": state.is_ready() }))
-        .into_response()
+    // rss_mb + heap_budget_mb are additive observability fields (spec
+    // index-rs-scale-100x R4 — OOM debugging); rss_mb is null off-Linux.
+    Json(json!({
+        "status": "ok",
+        "docs": engine.num_docs(),
+        "ready": state.is_ready(),
+        "rss_mb": crate::engine::rss_mb(),
+        "heap_budget_mb": crate::engine::heap_budget_mb(),
+    }))
+    .into_response()
 }
 
 pub async fn root_handler() -> Response {
@@ -1327,4 +1369,33 @@ pub async fn mget_handler(
         })
         .collect();
     Json(json!({ "docs": docs })).into_response()
+}
+
+/// Pure cache-eligibility decision for `POST /:index/_search` — extracted so
+/// it can be unit-tested directly: a scroll-shaped request (or an explicit
+/// no-cache/no-store header bypass) must never read from or write to the
+/// hot-query cache.
+fn is_cacheable(scroll_requested: bool, bypass_cache: bool) -> bool {
+    !scroll_requested && !bypass_cache
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cacheable;
+
+    #[test]
+    fn plain_search_is_cacheable() {
+        assert!(is_cacheable(false, false));
+    }
+
+    #[test]
+    fn scroll_shaped_request_bypasses() {
+        assert!(!is_cacheable(true, false));
+    }
+
+    #[test]
+    fn header_bypass_request_bypasses() {
+        assert!(!is_cacheable(false, true));
+        assert!(!is_cacheable(true, true));
+    }
 }

@@ -228,14 +228,22 @@ pub async fn mined_synonym_terms(pool: &PgPool) -> Result<Vec<String>, String> {
 
 pub async fn connect(url: &str) -> Result<PgPool, String> {
     PgPoolOptions::new()
-        .max_connections(4)
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        // 4 conns was too tight: single-row upserts take 1-15s on this disk
+        // under load, 4 in-flight slow statements starved acquire() for
+        // everyone else (production finding 2026-11-08 — bulk items 503ing
+        // with "pool timed out"). 16 absorbs the latency spikes.
+        .max_connections(16)
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(url)
         .await
         .map_err(|e| format!("connect postgres: {e}"))
 }
 
 /// All rows → corpus docs (ordered by slug for deterministic builds).
+/// Production build paths must NOT use this — it materializes the whole
+/// corpus in RAM (the 130k-doc OOM). It stays for small test/debug flows;
+/// builds go through [`stream_pages`].
+#[allow(dead_code)]
 pub async fn load_all(pool: &PgPool) -> Result<Vec<EngineDoc>, String> {
     let rows = sqlx::query_as::<_, (String, serde_json::Value, Option<Vec<u8>>)>(
         "SELECT slug, doc, embedding FROM catalog_documents ORDER BY slug",
@@ -251,6 +259,77 @@ pub async fn load_all(pool: &PgPool) -> Result<Vec<EngineDoc>, String> {
             embedding: emb.map(|b| bytes_to_vec(&b)),
         })
         .collect())
+}
+
+/// Keyset page size for the streaming build (spec index-rs-scale-100x R1):
+/// `WHERE slug > $last ORDER BY slug LIMIT $n`, one round trip per page,
+/// no server-side cursor, O(page) RAM. Deterministic (slug-ascending).
+pub const STREAM_PAGE: usize = 1000;
+
+/// One keyset page: rows with `slug > last` (all rows when `last` is
+/// None), slug-ascending, at most `limit`. Embeddings decode per row
+/// exactly like `load_all` — the corpus is never materialized whole.
+pub async fn fetch_page_after(
+    pool: &PgPool,
+    last: Option<&str>,
+    limit: usize,
+) -> Result<Vec<EngineDoc>, String> {
+    let rows = sqlx::query_as::<_, (String, serde_json::Value, Option<Vec<u8>>)>(
+        r#"SELECT slug, doc, embedding FROM catalog_documents
+           WHERE ($1::text IS NULL OR slug > $1)
+           ORDER BY slug LIMIT $2"#,
+    )
+    .bind(last)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("stream catalog_documents page (after {last:?}): {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(slug, doc, emb)| EngineDoc {
+            slug,
+            doc,
+            embedding: emb.map(|b| bytes_to_vec(&b)),
+        })
+        .collect())
+}
+
+/// In-memory mirror of the keyset pagination above (unit-test seam — no
+/// Postgres needed to validate the batching logic): rows with slug > last,
+/// slug-ascending, at most `limit`. `sorted` must be slug-ascending.
+pub(crate) fn keyset_page<'a>(
+    sorted: &'a [EngineDoc],
+    last: Option<&str>,
+    limit: usize,
+) -> &'a [EngineDoc] {
+    let start = match last {
+        None => 0,
+        Some(l) => sorted.partition_point(|d| d.slug.as_str() <= l),
+    };
+    &sorted[start..(start + limit).min(sorted.len())]
+}
+
+/// Stream the whole corpus through `f`, one keyset page at a time (spec
+/// index-rs-scale-100x R1): each page moves its docs to `f` and is dropped
+/// — peak RAM is O(STREAM_PAGE), independent of corpus size. Returns the
+/// total doc count. `f`'s future controls backpressure (a bounded channel
+/// on the caller side caps in-flight pages).
+pub async fn stream_pages<F, Fut>(pool: &PgPool, mut f: F) -> Result<usize, String>
+where
+    F: FnMut(Vec<EngineDoc>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last: Option<String> = None;
+    let mut total = 0usize;
+    loop {
+        let page = fetch_page_after(pool, last.as_deref(), STREAM_PAGE).await?;
+        if page.is_empty() {
+            return Ok(total);
+        }
+        total += page.len();
+        last = Some(page.last().expect("page is non-empty").slug.clone());
+        f(page).await?;
+    }
 }
 
 /// Rows per multi-row INSERT + COMMIT during `--backfill`. One round trip

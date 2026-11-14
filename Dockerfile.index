@@ -2,7 +2,9 @@
 # rust-embedded-rag): OpenSearch REST subset over Tantivy BM25 +
 # brute-force kNN. musl → scratch, same pattern as Dockerfile.core.
 # Build context: repo root (`docker build -f Dockerfile.index .`).
-FROM rust:1-slim AS build
+# Pinned toolchain: rust:1 pulled a rustc whose type-inference change (rust-lang/rust#148922)
+# breaks sqlx-postgres 0.7.4; 1.99.1 is the toolchain the crates are tested against.
+FROM rust:1.99.1-slim AS build
 WORKDIR /src
 
 # musl toolchain for a fully static binary (scratch final stage).
