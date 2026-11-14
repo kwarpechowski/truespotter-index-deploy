@@ -186,14 +186,25 @@ pub(crate) async fn build_engine_streaming(
     });
     // Feed keyset pages into the channel. A send error means the builder
     // already failed — stop early and report the builder's error.
-    let fed = store::stream_pages(pool, |page| async {
-        if tx.send(page).await.is_err() {
-            Err("streaming build stopped mid-feed (builder failed)".to_string())
-        } else {
-            Ok(())
-        }
-    })
-    .await;
+    //
+    // OWNERSHIP (prod hang 2026-11-14): tx must be MOVED into the feed
+    // closure. When stream_pages consumes and drops the closure, the last
+    // sender drops and the builder's blocking_recv returns None. Borrowing
+    // tx instead deadlocks: it would stay alive in this frame past
+    // build.await, so the builder would wait for a next page forever.
+    let fed = {
+        let feed = move |page: Vec<engine::EngineDoc>| {
+            let tx = tx.clone();
+            async move {
+                if tx.send(page).await.is_err() {
+                    Err("streaming build stopped mid-feed (builder failed)".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        store::stream_pages(pool, feed).await
+    };
     match build.await {
         Ok(Ok(built)) => match fed {
             Ok(n) => Ok((built, n)),
